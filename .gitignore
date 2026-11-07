@@ -1,0 +1,11 @@
+node_modules/
+backend/.venv/
+backend/data/
+backend/app/static/
+__pycache__/
+*.pyc
+.vscode/
+config/
+media/
+.screenshots/
+*.log

@@ -1,0 +1,23 @@
+services:
+  anime-renamer:
+    build: .
+    image: anime-renamer:latest
+    container_name: anime-renamer
+    ports:
+      - "8080:8080"
+    environment:
+      TZ: Asia/Shanghai
+      # 让容器内进程以你的宿主机用户身份写文件，避免生成 root 所有的文件
+      PUID: "1000"
+      PGID: "1000"
+      MEDIA_ROOT: /media
+      APP_CONFIG_DIR: /config
+    # 方便容器访问 Windows 宿主机上的代理（代理地址填 host.docker.internal）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # 左边改成你自己的动画目录；容器内固定为 /media
+      - ./media:/media
+      # 配置、预设、SQLite 与缓存
+      - ./config:/config
+    restart: unless-stopped

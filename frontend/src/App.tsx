@@ -1,20 +1,57 @@
 import { useEffect, useState } from "react";
-import { Layout, Menu, Modal, message } from "antd";
+import { Layout, Menu, Modal, Space, Tag, Typography, message } from "antd";
 import { EditOutlined, FolderOpenOutlined, LinkOutlined, SettingOutlined } from "@ant-design/icons";
 import { api } from "./api";
-import type { Preset, ScanPayload } from "./types";
+import type { Preset, QueueView, ScanPayload } from "./types";
 import ScanPage from "./pages/ScanPage";
 import MatchPage from "./pages/MatchPage";
 import TemplatePage from "./pages/TemplatePage";
 import SettingsPage from "./pages/SettingsPage";
+import LoginPage from "./pages/LoginPage";
 
 const { Header, Content } = Layout;
+const { Text } = Typography;
+
+const STEPS = [
+  { key: "scan", label: "扫描" },
+  { key: "match", label: "匹配作品" },
+  { key: "preview", label: "模板与预览" },
+  { key: "done", label: "已完成" },
+];
 
 export default function App() {
   const [page, setPage] = useState("scan");
   const [scan, setScan] = useState<ScanPayload | null>(null);
+  const [queue, setQueue] = useState<QueueView | null>(null);
   const [presets, setPresets] = useState<Preset[]>([]);
   const [presetId, setPresetId] = useState("");
+  const [auth, setAuth] = useState<{ enabled: boolean; authenticated: boolean } | null>(null);
+  const ready = auth === null || !auth.enabled || auth.authenticated;
+
+  useEffect(() => {
+    api.authStatus().then(setAuth).catch(() => setAuth({ enabled: false, authenticated: true }));
+    const onUnauthorized = () => setAuth({ enabled: true, authenticated: false });
+    window.addEventListener("ani-unauthorized", onUnauthorized);
+    return () => window.removeEventListener("ani-unauthorized", onUnauthorized);
+  }, []);
+
+  const loadQueue = async (scanId: string) => {
+    try {
+      setQueue(await api.queue(scanId));
+    } catch (error) {
+      message.error(`读取清单失败：${(error as Error).message}`);
+    }
+  };
+
+  const updateScan = (payload: ScanPayload | null) => {
+    setScan(payload);
+    if (payload) void loadQueue(payload.scan_id);
+    else setQueue(null);
+  };
+
+  useEffect(() => {
+    if (scan?.scan_id) void loadQueue(scan.scan_id);
+  }, [scan?.scan_id]);
 
   const loadPresets = async (selectId?: string) => {
     try {
@@ -34,8 +71,8 @@ export default function App() {
   };
 
   useEffect(() => {
-    loadPresets();
-  }, []);
+    if (ready) loadPresets();
+  }, [ready]);
 
   const changePreset = async (id: string) => {
     if (id === presetId) return;
@@ -84,6 +121,10 @@ export default function App() {
     }
   };
 
+  if (!ready) {
+    return <LoginPage onLoggedIn={() => setAuth({ enabled: true, authenticated: true })} />;
+  }
+
   return (
     <Layout style={{ minHeight: "100vh" }}>
       <Header style={{ display: "flex", alignItems: "center", gap: 24, background: "#101828" }}>
@@ -105,11 +146,31 @@ export default function App() {
         />
       </Header>
       <Content style={{ padding: 24, width: "100%", maxWidth: 1400, margin: "0 auto", boxSizing: "border-box" }}>
+        {scan && queue && (
+          <Space wrap size={8} style={{ marginBottom: 16 }}>
+            <Text type="secondary">流程：</Text>
+            {STEPS.map((step) => {
+              const active =
+                (step.key === "preview" && page === "templates") ||
+                (step.key !== "preview" && page === step.key);
+              return (
+                <Tag key={step.key} color={active ? "blue" : undefined}>
+                  {step.label} {queue.counts[step.key as keyof typeof queue.counts] ?? 0}
+                </Tag>
+              );
+            })}
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              条目在页面之间是「移动」不是复制，同一文件不会重复出现或被重复执行。
+            </Text>
+          </Space>
+        )}
         {page === "scan" && (
           <ScanPage
             scan={scan}
-            onScan={setScan}
+            queue={queue}
+            onScan={updateScan}
             onNext={() => setPage("match")}
+            reloadQueue={() => (scan ? loadQueue(scan.scan_id) : Promise.resolve())}
             presets={presets}
             presetId={presetId}
             onPresetChange={changePreset}
@@ -118,7 +179,9 @@ export default function App() {
         {page === "match" && (
           <MatchPage
             scan={scan}
+            queue={queue}
             onScanUpdate={setScan}
+            reloadQueue={() => (scan ? loadQueue(scan.scan_id) : Promise.resolve())}
             onGoScan={() => setPage("scan")}
             onNext={() => setPage("templates")}
           />
@@ -126,11 +189,14 @@ export default function App() {
         {page === "templates" && (
           <TemplatePage
             scan={scan}
+            queue={queue}
+            reloadQueue={() => (scan ? loadQueue(scan.scan_id) : Promise.resolve())}
             presets={presets}
             presetId={presetId}
             onPresetChange={changePreset}
             reloadPresets={loadPresets}
             onGoScan={() => setPage("scan")}
+            onScan={updateScan}
           />
         )}
         {page === "settings" && <SettingsPage />}

@@ -59,8 +59,11 @@ def build_groups(files: list[dict]) -> list[dict]:
                 "episode_count": 0,
                 "special_count": 0,
                 "movie_count": 0,
+                "episode_min": None,
+                "episode_max": None,
                 "tmdb_ids": set(),
                 "matched_name": "",
+                "name_source": "",
                 "confidence": confidence,
                 "needs_confirm": needs_confirm,
                 "source": source,
@@ -72,6 +75,12 @@ def build_groups(files: list[dict]) -> list[dict]:
         kind = row.get("kind")
         if kind == "episode":
             group["episode_count"] += 1
+            number = row.get("episode")
+            if isinstance(number, int):
+                current_min = group.get("episode_min")
+                current_max = group.get("episode_max")
+                group["episode_min"] = number if current_min is None else min(current_min, number)
+                group["episode_max"] = number if current_max is None else max(current_max, number)
         elif kind == "special":
             group["special_count"] += 1
         elif kind == "movie":
@@ -83,16 +92,20 @@ def build_groups(files: list[dict]) -> list[dict]:
         if str(fields.get("tmdb_id") or "").strip():
             group["tmdb_ids"].add(str(fields.get("tmdb_id")))
             group["matched_name"] = str(fields.get("series") or "")
+            if fields.get("name_source"):
+                group["name_source"] = str(fields.get("name_source"))
 
     result = []
     for group in groups.values():
         tmdb_ids = sorted(group.pop("tmdb_ids"))
         matched_name = group.pop("matched_name")
+        name_source = group.pop("name_source")
         group["seasons"] = sorted(group["seasons"])
         group["match"] = (
             {
                 "tmdb_id": int(tmdb_ids[0]) if tmdb_ids[0].isdigit() else tmdb_ids[0],
                 "name": matched_name,
+                "name_source": name_source,
             }
             if tmdb_ids
             else None
@@ -203,8 +216,15 @@ def auto_pick(group: dict, candidates: list[dict]) -> tuple[str, dict | None, li
     return ("auto" if confident else "choose"), top["candidate"], scored
 
 
-def build_updates(rows: list[dict], meta: dict) -> tuple[dict[str, dict], list[str]]:
-    """根据 TMDB 详情生成每个文件的字段更新；返回（更新表, 缺失集列表）。"""
+def build_updates(
+    rows: list[dict],
+    meta: dict,
+    season_override: int | None = None,
+) -> tuple[dict[str, dict], list[str]]:
+    """根据 TMDB 详情生成每个文件的字段更新；返回（更新表, 缺失集列表）。
+
+    season_override 用于用户指定季号后重新抓取该季的单集信息，只影响正片，特典季号仍为 0。
+    """
     base = {
         "tmdb_id": str(meta.get("tmdb_id") or ""),
         "original_title": str(meta.get("original_name") or ""),
@@ -212,6 +232,9 @@ def build_updates(rows: list[dict], meta: dict) -> tuple[dict[str, dict], list[s
     }
     if meta.get("name"):
         base["series"] = str(meta["name"])
+    if meta.get("name_source"):
+        # 只做标记用：这个作品名是从简体 / 繁体 / 原名 / 英文里哪一档取来的
+        base["name_source"] = str(meta["name_source"])
     if meta.get("media_type") == "movie":
         base["air_date"] = str(meta.get("release_date") or "")
         base["ep_title"] = ""
@@ -232,15 +255,23 @@ def build_updates(rows: list[dict], meta: dict) -> tuple[dict[str, dict], list[s
                 number = row.get("special_no") or row.get("episode")
                 if season != 0:
                     season = row.get("season")
+            elif kind == "episode" and isinstance(season_override, int):
+                season = season_override
             if isinstance(season, int) and isinstance(number, int):
                 episode_meta = episodes.get(f"{season}:{number}")
                 if episode_meta:
                     fields["ep_title"] = episode_meta.get("name") or ""
                     fields["air_date"] = episode_meta.get("air_date") or ""
                 else:
-                    label = f"S{season:02d}E{number:02d}"
-                    if label not in missing:
-                        missing.append(label)
+                    if season_override is not None and kind == "episode":
+                        # 切换季号后，原来那一季的单集标题不能继续沿用
+                        fields["ep_title"] = ""
+                        fields["air_date"] = ""
+                    # 特典在 TMDB 里本来就不一定有对应集，不算“缺集”警告
+                    if not (kind == "special" and season == 0):
+                        label = f"S{season:02d}E{number:02d}"
+                        if label not in missing:
+                            missing.append(label)
         updates[str(row["id"])] = fields
 
     return updates, missing

@@ -7,12 +7,11 @@ import unicodedata
 from pathlib import Path
 
 from .fields import FIELD_REGISTRY
+from .lexicon import SPECIAL_SEASON_FOLDER_NAMES
 
 EMPTY = "\x00"
 TOKEN_RE = re.compile(r"({{|}})|{(?P<key>[A-Za-z_][A-Za-z0-9_]*)(?::(?P<spec>[^{}]*))?}")
 FORMAT_SPEC_RE = re.compile(r"0(\d{1,2})")
-# 特典季目录的几种写法，渲染时统一成设置里选择的名字
-SPECIALS_SEGMENTS = {"specials", "special", "season 00", "season 0", "season00", "s00"}
 
 
 def _parse_tokens(pattern: str) -> tuple[list[tuple], list[str]]:
@@ -62,6 +61,8 @@ def _format_value(value: object, spec: str, key: str, errors: list[str]) -> str:
 def _cleanup(text: str) -> str:
     value = text.replace(EMPTY, "")
     value = re.sub(r"[\[\(【]\s*[\]\)】]", "", value)
+    # 变量为空后残留的 [v] / [Ver.] / [version] 这类版本壳子，一并折掉
+    value = re.sub(r"(?i)[\[\(【]\s*(?:v|ver|version)\.?\s*[\]\)】]", "", value)
     value = re.sub(r"\s+", " ", value)
     value = re.sub(r"(\s*-\s*){2,}", " - ", value)
     value = re.sub(r"(\s*_\s*){2,}", "_", value)
@@ -207,7 +208,7 @@ def build_target(
             if part in (".", ".."):
                 errors.append("路径中不能包含 . 或 ..")
                 break
-            if part.strip().lower() in SPECIALS_SEGMENTS:
+            if part.strip().lower() in SPECIAL_SEASON_FOLDER_NAMES:
                 part = specials_name
             value, truncated = sanitize_component(part, forbidden, max_bytes)
             if truncated:

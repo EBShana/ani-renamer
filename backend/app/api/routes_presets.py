@@ -160,6 +160,7 @@ class PreviewRequest(BaseModel):
     preset_id: str | None = None
     templates: dict[str, TemplateSpec] | None = None
     file_ids: list[str] | None = None
+    folder_ids: list[str] | None = None
     subtitle_mode: str | None = None
     limit: int = 0
 
@@ -191,6 +192,7 @@ def preview(payload: PreviewRequest) -> dict:
         payload.file_ids,
         payload.limit,
         payload.subtitle_mode,
+        payload.folder_ids,
     )
     return {
         "preset_id": result["preset_id"],
@@ -199,4 +201,5 @@ def preview(payload: PreviewRequest) -> dict:
         "subtitle_mode": result["subtitle_mode"],
         "rows": result["rows"],
         "summary": result["summary"],
+        "duplicates": result.get("duplicates", []),
     }

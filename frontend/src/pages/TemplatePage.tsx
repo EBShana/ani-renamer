@@ -5,6 +5,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Divider,
   Empty,
   Input,
@@ -34,25 +35,51 @@ import type { ColumnsType } from "antd/es/table";
 import { api } from "../api";
 import type {
   Category,
+  ConflictAction,
+  ConflictItem,
+  ConflictView,
+  DuplicateGroup,
   FieldPayload,
   Kind,
   OperationProgress,
   OperationRecord,
+  ParsedFile,
   Preset,
   PreviewResponse,
   PreviewRow,
+  QueueEntry,
+  QueueView,
   ScanPayload,
   TemplateSpec,
 } from "../types";
 import { CATEGORY_LABELS } from "../types";
+import ListFilterBar, { EMPTY_FILTER, entryMatches, type ListFilterValue } from "../listFilters";
 
 const { Text, Title } = Typography;
 
-const CONFLICT_LABELS: Record<string, string> = {
+const RESOLVE_LABELS: Record<string, string> = {
   skip: "跳过",
   overwrite: "覆盖",
-  suffix: "自动加序号",
+  suffix: "生成副本",
+  "merge-skip": "合并（同名项跳过）",
+  "merge-overwrite": "合并（同名项覆盖）",
+  "merge-suffix": "合并（同名项生成副本）",
 };
+
+const FILE_ACTION_OPTIONS: { value: ConflictAction; label: string }[] = [
+  { value: "skip", label: "跳过" },
+  { value: "overwrite", label: "覆盖" },
+  { value: "suffix", label: "生成副本" },
+];
+
+const FOLDER_ACTION_OPTIONS: { value: ConflictAction; label: string }[] = [
+  { value: "skip", label: "整体跳过" },
+  { value: "overwrite", label: "整体覆盖" },
+  { value: "suffix", label: "整体生成副本" },
+  { value: "merge-skip", label: "合并：同名项跳过" },
+  { value: "merge-overwrite", label: "合并：同名项覆盖" },
+  { value: "merge-suffix", label: "合并：同名项生成副本" },
+];
 
 const OPERATION_STATUS_TAGS: Record<string, { color: string; label: string }> = {
   queued: { color: "blue", label: "排队中" },
@@ -75,6 +102,7 @@ const historyColumns = (
   onPause: (id: string) => void,
   onContinue: (id: string) => void,
   onCancel: (id: string) => void,
+  onResolve: (id: string) => void,
 ): ColumnsType<OperationRecord> => [
   {
     title: "时间",
@@ -121,7 +149,8 @@ const historyColumns = (
       const running = status === "running";
       const queued = status === "queued";
       const paused = status === "paused";
-      const resumable = status === "interrupted" || status === "partial" || status === "conflict";
+      const conflict = status === "conflict";
+      const resumable = status === "interrupted" || status === "partial";
       const undoable =
         status === "done" || status === "partial" || status === "conflict" ||
         status === "cancelled" || status === "interrupted";
@@ -145,6 +174,16 @@ const historyColumns = (
           {(running || paused) && (
             <Button size="small" danger loading={busy === value} onClick={() => onCancel(value)}>
               取消
+            </Button>
+          )}
+          {conflict && (
+            <Button
+              size="small"
+              type="primary"
+              loading={busy === value}
+              onClick={() => onResolve(value)}
+            >
+              处理冲突
             </Button>
           )}
           {resumable && (
@@ -194,21 +233,29 @@ function basename(path: string): string {
 
 interface Props {
   scan: ScanPayload | null;
+  queue: QueueView | null;
+  reloadQueue: () => Promise<void>;
   presets: Preset[];
   presetId: string;
   onPresetChange: (id: string) => void;
   reloadPresets: (selectId?: string) => Promise<Preset[]>;
   onGoScan: () => void;
+  onScan: (payload: ScanPayload) => void;
 }
 
 export default function TemplatePage({
   scan,
+  queue,
+  reloadQueue,
   presets,
   presetId,
   onPresetChange,
   reloadPresets,
   onGoScan,
+  onScan,
 }: Props) {
+  const [checkedEntries, setCheckedEntries] = useState<string[]>([]);
+  const [filters, setFilters] = useState<ListFilterValue>(EMPTY_FILTER);
   const [draft, setDraft] = useState<Preset | null>(null);
   const [kind, setKind] = useState<Kind>("episode");
   const [fields, setFields] = useState<FieldPayload | null>(null);
@@ -223,9 +270,22 @@ export default function TemplatePage({
   const [saveAsOpen, setSaveAsOpen] = useState(false);
   const [saveAsName, setSaveAsName] = useState("");
   const [executing, setExecuting] = useState(false);
+  const [previewNonce, setPreviewNonce] = useState(0);
+  const [duplicateChecked, setDuplicateChecked] = useState<Record<string, string[]>>({});
+  const [explainFiles, setExplainFiles] = useState<string[] | null>(null);
   const [progress, setProgress] = useState<OperationProgress | null>(null);
   const [history, setHistory] = useState<OperationRecord[]>([]);
   const [undoing, setUndoing] = useState("");
+  const [conflictView, setConflictView] = useState<ConflictView | null>(null);
+  const [conflictChoices, setConflictChoices] = useState<Record<number, ConflictAction>>({});
+  const [conflictChecked, setConflictChecked] = useState<number[]>([]);
+  const [conflictLoading, setConflictLoading] = useState(false);
+  const [overwriteConfirm, setOverwriteConfirm] = useState<{
+    targets: ConflictItem[];
+    folderOverwrite: boolean;
+    choices: { seq: number; action: ConflictAction }[];
+  } | null>(null);
+  const openedConflictRef = useRef<string | null>(null);
   const editorRef = useRef<HTMLTextAreaElement | null>(null);
   const importRef = useRef<HTMLInputElement | null>(null);
 
@@ -248,6 +308,10 @@ export default function TemplatePage({
   }, []);
 
   useEffect(() => {
+    setCheckedEntries(scan?.selections?.preview ?? []);
+  }, [scan?.scan_id]);
+
+  useEffect(() => {
     const id = progress?.operation_id;
     const status = progress?.status;
     if (!id || !status || !ACTIVE_STATUSES.includes(status)) return;
@@ -257,6 +321,8 @@ export default function TemplatePage({
         setProgress(next);
         if (!ACTIVE_STATUSES.includes(next.status)) {
           await loadHistory();
+          // 成功的条目已移出清单，刷新后剩余条目仍在原处
+          await reloadQueue();
         }
       } catch {
         // 轮询失败下一次再试
@@ -288,6 +354,12 @@ export default function TemplatePage({
     }
   }, [presetId, presets]);
 
+  const previewEntries = useMemo(
+    () => (queue?.entries ?? []).filter((entry) => entry.stage === "preview"),
+    [queue],
+  );
+  const previewEntryIds = previewEntries.map((entry) => entry.entry_id).join(",");
+
   useEffect(() => {
     if (!draft) return;
     const timer = window.setTimeout(async () => {
@@ -300,10 +372,25 @@ export default function TemplatePage({
             scan_id: scan?.scan_id,
             preset_id: draft.id,
             templates: draft.templates,
+            file_ids: queue
+              ? previewEntries.flatMap((entry) => (entry.is_folder ? [] : entry.file_ids))
+              : undefined,
+            folder_ids: queue
+              ? previewEntries.filter((entry) => entry.is_folder).map((entry) => entry.folder_key || "")
+              : undefined,
           }),
         ]);
         setValidation(checked);
         setPreview(result);
+        if (explainFiles && explainFiles.length) {
+          const names = result.rows
+            .filter((row) => row.file_id && explainFiles.includes(row.file_id) && row.new_name)
+            .map((row) => row.new_name);
+          if (names.length) {
+            message.success(`模板已加入区分变量，将生成：${names.slice(0, 4).join(" / ")}`);
+          }
+          setExplainFiles(null);
+        }
       } catch (error) {
         message.error(`预览失败：${(error as Error).message}`);
       } finally {
@@ -311,7 +398,7 @@ export default function TemplatePage({
       }
     }, 450);
     return () => window.clearTimeout(timer);
-  }, [draft, kind, scan?.scan_id, configValues]);
+  }, [draft, kind, scan?.scan_id, configValues, queue, previewEntryIds, previewNonce]);
 
   const updateConfig = async (patch: Record<string, unknown>) => {
     try {
@@ -462,6 +549,184 @@ export default function TemplatePage({
     }
   };
 
+  const openConflicts = async (operationId: string) => {
+    setConflictLoading(true);
+    try {
+      const view = await api.conflicts(operationId);
+      const defaults: Record<number, ConflictAction> = {};
+      for (const item of [...view.files, ...view.folders]) defaults[item.seq] = "skip";
+      setConflictChoices(defaults);
+      setConflictChecked([]);
+      setConflictView(view);
+    } catch (error) {
+      message.error(`读取冲突失败：${(error as Error).message}`);
+    } finally {
+      setConflictLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    const id = progress?.operation_id;
+    if (!id || progress?.status !== "conflict") return;
+    if (openedConflictRef.current === id) return;
+    openedConflictRef.current = id;
+    void openConflicts(id);
+  }, [progress?.operation_id, progress?.status]);
+
+  const toggleConflictCheck = (seq: number, on: boolean) => {
+    setConflictChecked((prev) => (on ? [...prev, seq] : prev.filter((item) => item !== seq)));
+  };
+
+  const applyConflictAction = (items: ConflictItem[], action: ConflictAction) => {
+    const ids = items.map((item) => item.seq);
+    const picked = ids.filter((id) => conflictChecked.includes(id));
+    const scope = picked.length ? picked : ids;
+    setConflictChoices((prev) => {
+      const next = { ...prev };
+      for (const id of scope) next[id] = action;
+      return next;
+    });
+    message.success(`已把 ${scope.length} 项设为「${RESOLVE_LABELS[action] ?? action}」`);
+  };
+
+  const statsText = (stats: {
+    file_skip?: number;
+    file_overwrite?: number;
+    file_suffix?: number;
+    folder_skip?: number;
+    folder_overwrite?: number;
+    folder_suffix?: number;
+    merge_folders?: number;
+    merge_skip?: number;
+    merge_overwrite?: number;
+    merge_suffix?: number;
+    merged_files?: number;
+  }) => {
+    const overwrite = (stats.file_overwrite ?? 0) + (stats.folder_overwrite ?? 0);
+    const skip = (stats.file_skip ?? 0) + (stats.folder_skip ?? 0) + (stats.merge_skip ?? 0);
+    const suffix =
+      (stats.file_suffix ?? 0) + (stats.folder_suffix ?? 0) + (stats.merge_suffix ?? 0);
+    const merge = stats.merge_folders ?? 0;
+    const moved = stats.merged_files ?? 0;
+    return `覆盖 ${overwrite} · 跳过 ${skip} · 生成副本 ${suffix} · 合并 ${merge} 个文件夹（移入 ${moved} 个文件）`;
+  };
+
+  const doResolve = async (
+    choices: { seq: number; action: ConflictAction }[],
+    confirmOverwrite = false,
+  ) => {
+    if (!conflictView) return;
+    setConflictLoading(true);
+    try {
+      const result = await api.resolve(conflictView.operation_id, choices, confirmOverwrite);
+      message.success(`冲突处理已提交：${statsText(result.resolution)}`);
+      openedConflictRef.current = null;
+      setConflictView(null);
+      setOverwriteConfirm(null);
+      setProgress(await api.progress(result.operation_id));
+      await loadHistory();
+      await reloadQueue();
+    } catch (error) {
+      message.error(`处理冲突失败：${(error as Error).message}`);
+    } finally {
+      setConflictLoading(false);
+    }
+  };
+
+  const submitConflicts = () => {
+    if (!conflictView) return;
+    const choices = [...conflictView.files, ...conflictView.folders].map((item) => ({
+      seq: item.seq,
+      action: (conflictChoices[item.seq] ?? "skip") as ConflictAction,
+    }));
+    const actionBySeq = new Map(choices.map((item) => [item.seq, item.action]));
+    const risky = [...conflictView.files, ...conflictView.folders].filter((item) => {
+      const action = actionBySeq.get(item.seq);
+      return action === "overwrite" || action === "merge-overwrite";
+    });
+    const folderOverwrite = conflictView.folders.some(
+      (item) => actionBySeq.get(item.seq) === "overwrite",
+    );
+    if (risky.length) {
+      setOverwriteConfirm({ targets: risky, folderOverwrite, choices });
+      return;
+    }
+    void doResolve(choices);
+  };
+
+  const conflictSections = (items: ConflictItem[]): { groupId: string; items: ConflictItem[] }[] => {
+    const map = new Map<string, ConflictItem[]>();
+    for (const item of items) {
+      const key = String(item.group_id ?? "");
+      const list = map.get(key) ?? [];
+      list.push(item);
+      map.set(key, list);
+    }
+    return Array.from(map.entries()).map(([groupId, groupItems]) => ({ groupId, items: groupItems }));
+  };
+
+  const decideDuplicate = async (
+    key: string,
+    action: "exclude" | "keep" | "keep_all" | "reset",
+  ) => {
+    if (!scan) return;
+    const fileIds = duplicateChecked[key] ?? [];
+    if ((action === "exclude" || action === "keep") && !fileIds.length) {
+      message.warning(
+        action === "exclude" ? "请先勾选要排除的文件" : "请先勾选要保留的文件（例如修正版 v2）",
+      );
+      return;
+    }
+    try {
+      await api.duplicateDecision({
+        scan_id: scan.scan_id,
+        key,
+        action,
+        file_ids: fileIds,
+      });
+      message.success(
+        action === "keep_all"
+          ? "已选择全部保留，请在模板里加入能区分版本的变量"
+          : action === "reset"
+            ? "已撤销这组重复集的选择"
+            : "重复集处理已保存",
+      );
+      setDuplicateChecked((prev) => ({ ...prev, [key]: [] }));
+      setPreviewNonce((value) => value + 1);
+    } catch (error) {
+      message.error(`保存重复集选择失败：${(error as Error).message}`);
+    }
+  };
+
+  const addTemplateVariable = (group: DuplicateGroup, key: "resolution" | "group") => {
+    if (!draft) return;
+    const token = `{${key}}`;
+    const pattern = draft.templates.episode.pattern;
+    setExplainFiles(group.files.map((file) => file.file_id));
+    if (pattern.includes(token)) {
+      setPreviewNonce((value) => value + 1);
+      message.info(`正片模板里已经有 ${token}，重新生成预览看看名字`);
+      return;
+    }
+    patchTemplate("episode", { pattern: `${pattern} - ${token}` });
+    message.success(`已把 ${token} 加入正片模板（还没保存），正在重新生成预览`);
+  };
+
+  const recheckAfterExecute = async () => {
+    if (!scan) return;
+    try {
+      const result = await api.recheck(scan.scan_id);
+      message.success(
+        `核对完成：还在 ${result.check.ok} 个，已移动 ${result.check.moved} 个，缺失 ${result.check.missing} 个`,
+      );
+      const fresh = await api.getScan(scan.scan_id);
+      onScan(fresh);
+      await reloadQueue();
+    } catch (error) {
+      message.error(`核对失败：${(error as Error).message}`);
+    }
+  };
+
   const handleExecute = () => {
     if (!draft) return;
     if (!scan) {
@@ -472,21 +737,95 @@ export default function TemplatePage({
       message.warning("已有执行任务在进行，请等它完成或取消");
       return;
     }
-    const ready = preview?.rows.filter((row) => row.action === "rename" && row.status !== "error") ?? [];
-    if (!ready.length) {
-      message.warning("当前没有可执行的文件");
+    const selected = previewEntries.filter((entry) => checkedEntries.includes(entry.entry_id));
+    const selectedIds = new Set(selected.map((entry) => entry.entry_id));
+    const candidateRows = queue
+      ? (preview?.rows ?? []).filter((row) => row.entry_id && selectedIds.has(row.entry_id))
+      : (preview?.rows ?? []);
+    const unresolved = candidateRows.filter(
+      (row) =>
+        row.status === "error" && (row.messages ?? []).some((text) => text.startsWith("重复集（")),
+    );
+    if (unresolved.length) {
+      message.warning("勾选的条目里有还没处理的重复集，请先在上方的「重复集提示」里选择处理方式");
       return;
     }
-    const policy = String(configValues["execution.conflict_policy"] ?? "skip");
+    const ready = candidateRows.filter((row) => row.action === "rename" && row.status !== "error");
+    if (!ready.length) {
+      message.warning(queue ? "勾选的条目里没有可执行的文件" : "当前没有可执行的文件");
+      return;
+    }
+    const selectedFileIds = selected.flatMap((entry) => (entry.is_folder ? [] : entry.file_ids));
+    const selectedFolderIds = selected
+      .filter((entry) => entry.is_folder)
+      .map((entry) => entry.folder_key || "");
+    const runExecute = async (confirmRisks: boolean) => {
+      const result = await api.execute({
+        scan_id: scan.scan_id,
+        preset_id: draft.id,
+        templates: draft.templates,
+        file_ids: queue ? selectedFileIds : undefined,
+        folder_ids: queue ? selectedFolderIds : undefined,
+        confirm_risks: confirmRisks,
+      });
+      if (result.needs_confirmation) {
+        const risks = result.risks ?? [];
+        Modal.confirm({
+          title: "执行前检查发现风险",
+          width: 640,
+          okText: "仍然继续",
+          cancelText: "取消",
+          content: (
+            <div>
+              <div style={{ marginBottom: 8 }}>
+                发现 {risks.length} 条需要留意的情况，不会自动中止：
+              </div>
+              <ul style={{ paddingLeft: 18, maxHeight: 260, overflow: "auto", color: "#a15c00" }}>
+                {risks.map((risk, index) => (
+                  <li key={`${risk.code}-${index}`} style={{ marginBottom: 4 }}>
+                    {risk.message}
+                  </li>
+                ))}
+              </ul>
+              <div style={{ marginTop: 8, color: "#888" }}>
+                选择「仍然继续」会按原计划执行；「取消」不会改动任何文件。
+              </div>
+            </div>
+          ),
+          onOk: async () => {
+            setExecuting(true);
+            try {
+              await runExecute(true);
+            } catch (error) {
+              message.error(`执行失败：${(error as Error).message}`);
+            } finally {
+              setExecuting(false);
+            }
+          },
+        });
+        return;
+      }
+      if (result.operation_id) {
+        message.success(
+          `任务已开始：共 ${result.total ?? 0} 个条目，分 ${result.batch_count ?? 1} 批执行`,
+        );
+        setProgress(await api.progress(result.operation_id));
+      } else {
+        message.info(result.message ?? "没有可执行的文件");
+      }
+      await loadHistory();
+    };
     Modal.confirm({
       title: "确认执行改名 / 移动？",
       content: (
         <div>
           <div>
-            将处理 {ready.length} 个文件，冲突策略：{CONFLICT_LABELS[policy] ?? policy}。
+            将处理 {queue ? selected.length : ready.length} 个勾选条目（{ready.length} 个文件）。
           </div>
           <div style={{ marginTop: 6, color: "#888" }}>
-            任务会在后台分批跑完，关掉页面也会继续；执行后会写入记录，可在「执行记录」里撤销。
+            目标已存在的文件不会打断任务，会先标记成「冲突，待处理」继续往下跑；
+            全部结束后统一弹出冲突面板，由你决定跳过 / 覆盖 / 生成副本或合并。
+            任务在后台分批执行，关掉页面也会继续，执行记录可撤销。
           </div>
         </div>
       ),
@@ -494,20 +833,7 @@ export default function TemplatePage({
       onOk: async () => {
         setExecuting(true);
         try {
-          const result = await api.execute({
-            scan_id: scan.scan_id,
-            preset_id: draft.id,
-            templates: draft.templates,
-          });
-          if (result.operation_id) {
-            message.success(
-              `任务已开始：共 ${result.total ?? 0} 个条目，分 ${result.batch_count ?? 1} 批执行`,
-            );
-            setProgress(await api.progress(result.operation_id));
-          } else {
-            message.info(result.message ?? "没有可执行的文件");
-          }
-          await loadHistory();
+          await runExecute(false);
         } catch (error) {
           message.error(`执行失败：${(error as Error).message}`);
           throw error;
@@ -626,65 +952,171 @@ export default function TemplatePage({
     return <Empty description="还没有预设，请检查后端是否正常" />;
   }
 
-  const columns: ColumnsType<PreviewRow> = [
-    {
-      title: "类别",
-      dataIndex: "category",
-      width: 84,
-      filters: (Object.keys(CATEGORY_LABELS) as Category[]).map((key) => ({
-        text: CATEGORY_LABELS[key],
-        value: key,
+  const rowsByEntry = useMemo(() => {
+    const map = new Map<string, PreviewRow[]>();
+    for (const row of preview?.rows ?? []) {
+      const key = row.entry_id || "";
+      if (!key) continue;
+      const list = map.get(key) ?? [];
+      list.push(row);
+      map.set(key, list);
+    }
+    return map;
+  }, [preview]);
+
+  const fileById = useMemo(
+    () => new Map<string, ParsedFile>((scan?.files ?? []).map((file) => [file.id, file])),
+    [scan],
+  );
+
+  const filteredEntries = useMemo(
+    () =>
+      previewEntries.filter((entry) => {
+        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+        const rowStatus = rows.some((row) => row.status === "error")
+          ? "error"
+          : rows.some((row) => row.status === "warning")
+            ? "warning"
+            : undefined;
+        return entryMatches(entry, filters, {
+          file: fileById.get(entry.file_ids[0] ?? ""),
+          rowStatus,
+          selected: checkedEntries.includes(entry.entry_id),
+        });
+      }),
+    [previewEntries, rowsByEntry, filters, checkedEntries, fileById],
+  );
+
+  const groupOptions = useMemo(
+    () =>
+      (scan?.groups ?? []).map((group) => ({
+        value: group.id,
+        label: group.name,
       })),
-      onFilter: (value, record) => record.category === value,
-      render: (value: Category) => <Tag>{CATEGORY_LABELS[value] ?? value}</Tag>,
+    [scan],
+  );
+
+  const filteredSelected = filteredEntries.filter((entry) => checkedEntries.includes(entry.entry_id)).length;
+
+  const previewGroups = useMemo(() => {
+    const map = new Map<string, QueueEntry[]>();
+    for (const entry of filteredEntries) {
+      const key = entry.work_key || entry.group_id || "unknown";
+      const list = map.get(key) ?? [];
+      list.push(entry);
+      map.set(key, list);
+    }
+    return Array.from(map.entries()).map(([key, entries]) => ({
+      key,
+      title: entries[0]?.title || "未命名作品",
+      year: entries[0]?.year,
+      entries: [...entries].sort(
+        (left, right) =>
+          (left.season ?? 0) - (right.season ?? 0) || (left.episode ?? 0) - (right.episode ?? 0),
+      ),
+    }));
+  }, [filteredEntries]);
+
+  const activeChecked = checkedEntries.filter((id) =>
+    previewEntries.some((entry) => entry.entry_id === id),
+  );
+
+  const persistSelection = (ids: string[]) => {
+    if (scan) void api.saveSelection(scan.scan_id, "preview", ids).catch(() => undefined);
+  };
+
+  const toggleEntry = (entryId: string, on: boolean) => {
+    const next = on ? [...checkedEntries, entryId] : checkedEntries.filter((id) => id !== entryId);
+    setCheckedEntries(next);
+    persistSelection(next);
+  };
+
+  const toggleMany = (entryIds: string[], on: boolean) => {
+    const rest = checkedEntries.filter((id) => !entryIds.includes(id));
+    const next = on ? [...rest, ...entryIds] : rest;
+    setCheckedEntries(next);
+    persistSelection(next);
+  };
+
+  const previewColumns: ColumnsType<QueueEntry> = [
+    {
+      title: "",
+      width: 40,
+      render: (_, entry) => (
+        <Checkbox
+          checked={activeChecked.includes(entry.entry_id)}
+          onChange={(event) => toggleEntry(entry.entry_id, event.target.checked)}
+        />
+      ),
     },
     {
-      title: "类型",
-      dataIndex: "kind",
-      width: 80,
-      render: (value: string, record) =>
-        record.category === "video" ? (
-          <Tag color={KIND_COLORS[value]}>
-            {KIND_TABS.find((item) => item.key === value)?.label ?? "未识别"}
-          </Tag>
-        ) : (
-          <Text type="secondary">-</Text>
-        ),
-    },
-    {
-      title: "原文件",
-      dataIndex: "original_path",
-      render: (value: string) => <div className="preview-name">{basename(value)}</div>,
-    },
-    {
-      title: "新名称 / 目标路径",
-      dataIndex: "new_name",
-      render: (value: string, record) => (
+      title: "条目",
+      width: 260,
+      render: (_, entry) => (
         <div>
-          <div className="preview-name" style={{ opacity: record.action === "skip" ? 0.55 : 1 }}>
-            {value || "-"}
-            {record.action === "skip" && "（不改名）"}
+          <div className="preview-name">
+            {entry.is_folder ? "[素材文件夹] " : ""}
+            {entry.filename}
           </div>
-          {record.new_path && record.new_path !== record.original_path && (
-            <div className="path-text">{record.new_path}</div>
-          )}
+          <div className="path-text">{entry.rel_path}</div>
         </div>
       ),
     },
     {
-      title: "状态",
-      dataIndex: "status",
+      title: "新名称 / 目标路径",
+      render: (_, entry) => {
+        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+        const main = rows.find((row) => row.category === "video") ?? rows[0];
+        if (!main) {
+          return <Text type="warning">没有预览结果（可能缺少作品信息）</Text>;
+        }
+        return (
+          <div>
+            <div className="preview-name" style={{ opacity: main.action === "skip" ? 0.55 : 1 }}>
+              {main.new_name || "-"}
+              {main.action === "skip" && "（不改名）"}
+            </div>
+            {main.new_path && main.new_path !== main.original_path && (
+              <div className="path-text">{main.new_path}</div>
+            )}
+          </div>
+        );
+      },
+    },
+    {
+      title: "字幕",
       width: 92,
-      render: (value: string) => {
-        const meta = STATUS_TAGS[value] ?? STATUS_TAGS.error;
+      render: (_, entry) => {
+        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+        const count = rows.filter((row) => row.category === "subtitle").length;
+        return count ? <Tag color="cyan">{count} 个（跟随）</Tag> : <Text type="secondary">-</Text>;
+      },
+    },
+    {
+      title: "状态",
+      width: 100,
+      render: (_, entry) => {
+        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+        const main = rows.find((row) => row.category === "video") ?? rows[0];
+        const meta = STATUS_TAGS[main?.status ?? "error"] ?? STATUS_TAGS.error;
         return <Tag color={meta.color}>{meta.label}</Tag>;
       },
     },
     {
       title: "提示",
-      dataIndex: "messages",
-      render: (values: string[]) =>
-        values.length ? <Text type="secondary">{values.join("；")}</Text> : <Text type="secondary">-</Text>,
+      render: (_, entry) => {
+        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+        const main = rows.find((row) => row.category === "video") ?? rows[0];
+        const messages = [...(main?.messages ?? [])];
+        if (entry.result?.message && entry.result.status !== "done") {
+          messages.push(entry.result.message);
+        }
+        return messages.length ? (
+          <Text type="secondary">{messages.join("；")}</Text>
+        ) : (
+          <Text type="secondary">-</Text>
+        );
+      },
     },
   ];
 
@@ -897,26 +1329,241 @@ export default function TemplatePage({
                 disabled={
                   !scan ||
                   Boolean(preview?.is_sample) ||
-                  Boolean(progress && ACTIVE_STATUSES.includes(progress.status))
+                  Boolean(progress && ACTIVE_STATUSES.includes(progress.status)) ||
+                  (queue ? activeChecked.length === 0 : false)
                 }
                 onClick={handleExecute}
               >
-                执行改名
+                执行勾选的 {activeChecked.length} 项
               </Button>
             </Tooltip>
           </Space>
         }
       >
-        <Table
-          rowKey="file_id"
-          size="small"
-          loading={loading}
-          columns={columns}
-          dataSource={preview?.rows ?? []}
-          pagination={{ pageSize: 10, showSizeChanger: true, showTotal: (total) => `共 ${total} 条` }}
-          scroll={{ x: 960 }}
-          locale={{ emptyText: <Title level={5} type="secondary">输入模板后自动刷新预览</Title> }}
+        <Space wrap style={{ marginBottom: 12 }}>
+          <Text type="secondary">
+            本页只包含从「匹配作品」带出来的条目。已选（筛选后）{filteredSelected} / 筛选结果{" "}
+            {filteredEntries.length} / 总已选 {activeChecked.length}
+          </Text>
+          <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), true)}>
+            全选本页
+          </Button>
+          <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), false)}>
+            全不选
+          </Button>
+        </Space>
+
+        {preview?.duplicates && preview.duplicates.length > 0 && (
+          <Card
+            size="small"
+            title={`重复集提示（${preview.duplicates.length} 组）`}
+            style={{ marginBottom: 12, borderColor: "#ff4d4f" }}
+          >
+            <Space direction="vertical" size={12} style={{ width: "100%" }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                同一个作品、同一季、同一集出现多个文件。勾选后选择「排除勾选的」或「只保留勾选的」；
+                如果只是同集多版本想分别保留，选「全部保留」并在模板里加入能区分的变量（例如 {"{version}、{resolution}"}）。
+                未处理时这组会阻止执行，不会自动当成两集，也不会静默覆盖。
+              </Text>
+              {preview.duplicates.map((group) => {
+                const checked = duplicateChecked[group.key] ?? [];
+                return (
+                  <Card
+                    key={group.key}
+                    size="small"
+                    type="inner"
+                    title={
+                      <Space wrap>
+                        <Text strong>
+                          {group.title}
+                          {group.year ? `（${group.year}）` : ""}
+                        </Text>
+                        <Tag color="red">
+                          S{String(group.season).padStart(2, "0")}E
+                          {String(group.episode).padStart(2, "0")}
+                        </Tag>
+                        <Tag color={group.kind === "parse_error" ? "orange" : "volcano"}>
+                          {group.kind_label}
+                        </Tag>
+                        {group.decision ? (
+                          <Tag color="green">
+                            已选择：
+                            {group.decision.action === "keep_all"
+                              ? "全部保留"
+                              : group.decision.action === "exclude"
+                                ? "排除勾选项"
+                                : "只保留勾选项"}
+                          </Tag>
+                        ) : (
+                          <Tag color="red">未处理（会阻止执行）</Tag>
+                        )}
+                      </Space>
+                    }
+                    extra={
+                      group.decision && (
+                        <Button size="small" onClick={() => decideDuplicate(group.key, "reset")}>
+                          重新选择
+                        </Button>
+                      )
+                    }
+                  >
+                    <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                      <Text type="secondary">{group.reason}</Text>
+                      {(group.kind === "multi_version" || group.kind === "multi_source") && (
+                        <Alert
+                          type="info"
+                          showIcon
+                          message={
+                            group.kind === "multi_version"
+                              ? "这可能是同一集的不同版本（例如画质不同），建议在正片模板里加入 {resolution} 或 {group}，让它们生成不同的名字。"
+                              : "这些文件可能来自不同来源或不同发布组，建议在正片模板里加入 {group} 或 {resolution} 来区分。"
+                          }
+                          description="点下面的按钮会把变量加到正片模板末尾（只改当前草稿，不会自动保存）并立即重新生成预览。如果预览还提示「重复集」，再点这组里的「全部保留（我自己在模板里区分）」让它放行。"
+                          action={
+                            <Space direction="vertical">
+                              <Button size="small" onClick={() => addTemplateVariable(group, "resolution")}>
+                                加入 {"{resolution}"}
+                              </Button>
+                              <Button size="small" onClick={() => addTemplateVariable(group, "group")}>
+                                加入 {"{group}"}
+                              </Button>
+                            </Space>
+                          }
+                        />
+                      )}
+                      {group.files.map((file) => (
+                        <Checkbox
+                          key={file.file_id}
+                          checked={checked.includes(file.file_id) || file.excluded}
+                          disabled={Boolean(group.decision) && file.excluded}
+                          onChange={(event) => {
+                            const next = event.target.checked
+                              ? [...checked, file.file_id]
+                              : checked.filter((id) => id !== file.file_id);
+                            setDuplicateChecked((prev) => ({ ...prev, [group.key]: next }));
+                          }}
+                        >
+                          <span className="preview-name">{file.filename}</span>
+                          <span className="path-text" style={{ marginLeft: 8 }}>
+                            {file.rel_path}
+                          </span>
+                          {file.version && <Tag style={{ marginLeft: 8 }}>v{file.version}</Tag>}
+                          {file.resolution && <Tag style={{ marginLeft: 8 }}>{file.resolution}</Tag>}
+                          {file.excluded && <Tag color="default" style={{ marginLeft: 8 }}>已排除</Tag>}
+                        </Checkbox>
+                      ))}
+                      <Space wrap>
+                        <Button
+                          size="small"
+                          disabled={Boolean(group.decision)}
+                          onClick={() => decideDuplicate(group.key, "exclude")}
+                        >
+                          排除勾选的（其余保留）
+                        </Button>
+                        <Button
+                          size="small"
+                          disabled={Boolean(group.decision)}
+                          onClick={() => decideDuplicate(group.key, "keep")}
+                        >
+                          只保留勾选的（其余排除，可用于保留修正版 v2）
+                        </Button>
+                        <Button
+                          size="small"
+                          disabled={Boolean(group.decision)}
+                          onClick={() => decideDuplicate(group.key, "keep_all")}
+                        >
+                          全部保留（我自己在模板里区分）
+                        </Button>
+                      </Space>
+                    </Space>
+                  </Card>
+                );
+              })}
+            </Space>
+          </Card>
+        )}
+
+        <ListFilterBar
+          value={filters}
+          onChange={setFilters}
+          groupOptions={groupOptions}
+          selectedCount={filteredSelected}
+          totalCount={filteredEntries.length}
         />
+        {previewEntries.length === 0 ? (
+          <Empty description="本页还没有条目，请先在「匹配作品」页勾选作品并点「下一步：带出」" />
+        ) : filteredEntries.length === 0 ? (
+          <Empty description="没有符合筛选条件的条目" />
+        ) : (
+          <Collapse
+            defaultActiveKey={previewGroups.map((group) => group.key)}
+            items={previewGroups.map((group) => {
+              const ids = group.entries.map((entry) => entry.entry_id);
+              const picked = ids.filter((id) => activeChecked.includes(id)).length;
+              return {
+                key: group.key,
+                label: (
+                  <Space>
+                    <Checkbox
+                      checked={picked === ids.length}
+                      indeterminate={picked > 0 && picked < ids.length}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) => toggleMany(ids, event.target.checked)}
+                    />
+                    <Text strong>{group.title}</Text>
+                    {group.year && <Tag color="blue">{group.year}</Tag>}
+                    <Tag>{ids.length} 个条目</Tag>
+                    {picked > 0 && <Tag color="green">已选 {picked}</Tag>}
+                  </Space>
+                ),
+                children: (
+                  <Table
+                    rowKey="entry_id"
+                    size="small"
+                    loading={loading}
+                    columns={previewColumns}
+                    dataSource={group.entries}
+                    pagination={{ pageSize: 12, showSizeChanger: true, showTotal: (total) => `共 ${total} 条` }}
+                    scroll={{ x: 900 }}
+                    expandable={{
+                      expandedRowRender: (entry) => {
+                        const rows = rowsByEntry.get(entry.entry_id) ?? [];
+                        if (!rows.length) {
+                          return <Text type="secondary">没有预览明细。</Text>;
+                        }
+                        return (
+                          <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                            {rows.map((row) => (
+                              <Text
+                                key={`${row.file_id}-${row.original_path}`}
+                                type="secondary"
+                                style={{ fontSize: 12 }}
+                              >
+                                [{CATEGORY_LABELS[row.category] ?? row.category}] {basename(row.original_path)} →{" "}
+                                {row.new_name || "-"}
+                                {row.messages.length ? `（${row.messages.join("；")}）` : ""}
+                              </Text>
+                            ))}
+                          </Space>
+                        );
+                      },
+                    }}
+                    locale={{ emptyText: <Empty description="没有预览结果" /> }}
+                  />
+                ),
+              };
+            })}
+          />
+        )}
+        {queue && queue.counts.done > 0 && (
+          <Alert
+            type="success"
+            showIcon
+            style={{ marginTop: 12 }}
+            message={`已完成 ${queue.counts.done} 个条目，已移出本页清单`}
+            description="需要回退时，到下面的「执行记录」里点「撤销」。"
+          />
+        )}
       </Card>
 
       {progress && (
@@ -960,24 +1607,34 @@ export default function TemplatePage({
                   取消
                 </Button>
               )}
+              {progress.status === "conflict" && (
+                <Button
+                  size="small"
+                  type="primary"
+                  loading={conflictLoading}
+                  onClick={() => void openConflicts(progress.operation_id)}
+                >
+                  处理冲突（{progress.conflict}）
+                </Button>
+              )}
               {["interrupted", "partial", "conflict"].includes(progress.status) && (
-                <>
-                  <Button
-                    size="small"
-                    loading={undoing === progress.operation_id}
-                    onClick={() => handleResume(progress.operation_id)}
-                  >
-                    续跑
-                  </Button>
-                  <Button
-                    size="small"
-                    danger
-                    loading={undoing === progress.operation_id}
-                    onClick={() => handleUndo(progress.operation_id)}
-                  >
-                    撤销
-                  </Button>
-                </>
+                <Button
+                  size="small"
+                  danger
+                  loading={undoing === progress.operation_id}
+                  onClick={() => handleUndo(progress.operation_id)}
+                >
+                  撤销
+                </Button>
+              )}
+              {["interrupted", "partial"].includes(progress.status) && (
+                <Button
+                  size="small"
+                  loading={undoing === progress.operation_id}
+                  onClick={() => handleResume(progress.operation_id)}
+                >
+                  续跑
+                </Button>
               )}
               {!ACTIVE_STATUSES.includes(progress.status) && (
                 <Button size="small" type="link" onClick={() => setProgress(null)}>
@@ -1009,6 +1666,7 @@ export default function TemplatePage({
               <Text type="secondary">
                 成功 {progress.done} · 跳过 {progress.skipped} · 失败 {progress.failed} · 冲突{" "}
                 {progress.conflict}
+                {progress.merged > 0 ? ` · 合并 ${progress.merged}` : ""}
               </Text>
               <Text type="secondary">
                 第 {progress.batch_index} / 共 {progress.batch_count} 批
@@ -1017,6 +1675,37 @@ export default function TemplatePage({
             <Text type="secondary" ellipsis style={{ maxWidth: "100%" }}>
               当前文件：{progress.current_item || "—"}
             </Text>
+            {progress.summary?.resolution && !ACTIVE_STATUSES.includes(progress.status) && (
+              <Alert
+                type={progress.status === "conflict" ? "warning" : "success"}
+                showIcon
+                message="冲突处理结果"
+                description={`${statsText(progress.summary.resolution)} · 源目录还剩 ${
+                  progress.summary.remaining_source ?? 0
+                } 个文件`}
+              />
+            )}
+            {!ACTIVE_STATUSES.includes(progress.status) &&
+              ["done", "partial", "conflict", "cancelled", "interrupted"].includes(
+                progress.status,
+              ) && (
+                <Alert
+                  type={progress.status === "done" ? "success" : "warning"}
+                  showIcon
+                  message="执行结束，默认不会自动重扫"
+                  description="需要确认文件现状时点「核对当前清单」；需要重新读取目录、发现新文件时点「完整重扫」。失败、合并 / 覆盖、取消后系统已经自动核对过一次。"
+                  action={
+                    <Space direction="vertical">
+                      <Button size="small" onClick={() => void recheckAfterExecute()}>
+                        核对当前清单
+                      </Button>
+                      <Button size="small" onClick={() => void onGoScan()}>
+                        完整重扫（去扫描页）
+                      </Button>
+                    </Space>
+                  }
+                />
+              )}
           </Space>
         </Card>
       )}
@@ -1047,6 +1736,7 @@ export default function TemplatePage({
               handlePause,
               handleContinue,
               handleCancel,
+              (id) => void openConflicts(id),
             )}
             scroll={{ x: 900 }}
           />
@@ -1066,6 +1756,233 @@ export default function TemplatePage({
           placeholder="新预设名称"
           onPressEnter={handleSaveAs}
         />
+      </Modal>
+
+      <Modal
+        title={conflictView ? `处理冲突（共 ${conflictView.total} 项）` : "处理冲突"}
+        open={!!conflictView}
+        width={1060}
+        maskClosable={false}
+        onCancel={() => setConflictView(null)}
+        footer={[
+          <Button key="later" onClick={() => setConflictView(null)}>
+            稍后处理
+          </Button>,
+          <Button key="go" type="primary" loading={conflictLoading} onClick={submitConflicts}>
+            开始处理
+          </Button>,
+        ]}
+      >
+        {conflictView && (
+          <Space direction="vertical" size={16} style={{ width: "100%" }}>
+            <Alert
+              type="warning"
+              showIcon
+              message="先选好处理方式再点「开始处理」。直接关闭不会执行任何覆盖，任务会停在「待处理冲突」。"
+              description="同名项指相对位置和名字都相同；文件名按 Windows 习惯不区分大小写。已有作品文件夹、Season 文件夹正常复用，不算冲突。"
+            />
+            {conflictView.groups.map((group) => {
+              const groupFiles = conflictView.files.filter(
+                (item) => String(item.group_id ?? "") === group.id,
+              );
+              const groupFolders = conflictView.folders.filter(
+                (item) => String(item.group_id ?? "") === group.id,
+              );
+              if (!groupFiles.length && !groupFolders.length) return null;
+              return (
+                <Card
+                  key={group.id || "root"}
+                  size="small"
+                  title={`目录组：${group.name || "未命名"}`}
+                >
+                  {groupFiles.length > 0 && (
+                    <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                      <Space wrap>
+                        <Text strong>文件冲突（{groupFiles.length}）</Text>
+                        <Text type="secondary">
+                          批量按钮只作用于本组勾选项；没勾选时作用于本组全部文件冲突
+                        </Text>
+                      </Space>
+                      <Space wrap>
+                        {FILE_ACTION_OPTIONS.map((option) => (
+                          <Button
+                            size="small"
+                            key={option.value}
+                            onClick={() => applyConflictAction(groupFiles, option.value)}
+                          >
+                            本组文件统一：{option.label}
+                          </Button>
+                        ))}
+                      </Space>
+                      <Table
+                        size="small"
+                        rowKey="seq"
+                        pagination={groupFiles.length > 8 ? { pageSize: 8, size: "small" } : false}
+                        dataSource={groupFiles}
+                        columns={[
+                          {
+                            title: "",
+                            width: 40,
+                            render: (_, item) => (
+                              <Checkbox
+                                checked={conflictChecked.includes(item.seq)}
+                                onChange={(event) =>
+                                  toggleConflictCheck(item.seq, event.target.checked)
+                                }
+                              />
+                            ),
+                          },
+                          {
+                            title: "源文件",
+                            render: (_, item) => (
+                              <div>
+                                <div className="preview-name">{basename(item.original_path)}</div>
+                                <div className="path-text">{item.original_path}</div>
+                              </div>
+                            ),
+                          },
+                          {
+                            title: "目标（已存在）",
+                            render: (_, item) => <div className="path-text">{item.target_path}</div>,
+                          },
+                          {
+                            title: "处理方式",
+                            width: 170,
+                            render: (_, item) => (
+                              <Select
+                                size="small"
+                                style={{ width: 156 }}
+                                value={conflictChoices[item.seq] ?? "skip"}
+                                options={FILE_ACTION_OPTIONS}
+                                onChange={(value: ConflictAction) =>
+                                  setConflictChoices((prev) => ({ ...prev, [item.seq]: value }))
+                                }
+                              />
+                            ),
+                          },
+                        ]}
+                      />
+                    </Space>
+                  )}
+
+                  {groupFolders.length > 0 && (
+                    <Space
+                      direction="vertical"
+                      size={8}
+                      style={{ width: "100%", marginTop: groupFiles.length ? 12 : 0 }}
+                    >
+                      <Space wrap>
+                        <Text strong>文件夹冲突（{groupFolders.length}）</Text>
+                        <Text type="secondary">
+                          「整体」会替换整个目标文件夹；「合并」只把内容搬进去，目标文件夹保留
+                        </Text>
+                      </Space>
+                      <Space wrap>
+                        {FOLDER_ACTION_OPTIONS.map((option) => (
+                          <Button
+                            size="small"
+                            key={option.value}
+                            onClick={() => applyConflictAction(groupFolders, option.value)}
+                          >
+                            本组文件夹统一：{option.label}
+                          </Button>
+                        ))}
+                      </Space>
+                      <Table
+                        size="small"
+                        rowKey="seq"
+                        pagination={
+                          groupFolders.length > 8 ? { pageSize: 8, size: "small" } : false
+                        }
+                        dataSource={groupFolders}
+                        columns={[
+                          {
+                            title: "",
+                            width: 40,
+                            render: (_, item) => (
+                              <Checkbox
+                                checked={conflictChecked.includes(item.seq)}
+                                onChange={(event) =>
+                                  toggleConflictCheck(item.seq, event.target.checked)
+                                }
+                              />
+                            ),
+                          },
+                          {
+                            title: "源文件夹",
+                            render: (_, item) => (
+                              <div>
+                                <div className="preview-name">{basename(item.original_path)}</div>
+                                <div className="path-text">{item.original_path}</div>
+                              </div>
+                            ),
+                          },
+                          {
+                            title: "目标（已存在）",
+                            render: (_, item) => <div className="path-text">{item.target_path}</div>,
+                          },
+                          {
+                            title: "处理方式",
+                            width: 220,
+                            render: (_, item) => (
+                              <Select
+                                size="small"
+                                style={{ width: 206 }}
+                                value={conflictChoices[item.seq] ?? "skip"}
+                                options={FOLDER_ACTION_OPTIONS}
+                                onChange={(value: ConflictAction) =>
+                                  setConflictChoices((prev) => ({ ...prev, [item.seq]: value }))
+                                }
+                              />
+                            ),
+                          },
+                        ]}
+                      />
+                    </Space>
+                  )}
+                </Card>
+              );
+            })}
+          </Space>
+        )}
+      </Modal>
+
+      <Modal
+        title="覆盖会永久删除目标内容，撤销无法恢复"
+        open={!!overwriteConfirm}
+        onCancel={() => setOverwriteConfirm(null)}
+        okText="确认覆盖"
+        okButtonProps={{ danger: true, loading: conflictLoading }}
+        onOk={() => overwriteConfirm && void doResolve(overwriteConfirm.choices, true)}
+      >
+        {overwriteConfirm && (
+          <Space direction="vertical" size={10} style={{ width: "100%" }}>
+            <Alert
+              type="error"
+              showIcon
+              message={`本次会永久删除 ${overwriteConfirm.targets.length} 处目标内容`}
+              description="删除后即使点「撤销」，这些被删掉的原内容也无法恢复。请确认这些目标确实是不需要的旧文件。"
+            />
+            {overwriteConfirm.folderOverwrite && (
+              <Alert
+                type="error"
+                showIcon
+                message="其中包含「整个文件夹覆盖」"
+                description="会删除整个目标文件夹以及它里面的全部内容，只保留你这次搬过去的新文件夹。"
+              />
+            )}
+            <div style={{ maxHeight: 200, overflow: "auto" }}>
+              {overwriteConfirm.targets.slice(0, 30).map((item) => (
+                <div key={item.seq} className="path-text">
+                  {item.target_path}
+                </div>
+              ))}
+              {overwriteConfirm.targets.length > 30 && (
+                <div className="path-text">……还有 {overwriteConfirm.targets.length - 30} 处</div>
+              )}
+            </div>
+          </Space>
+        )}
       </Modal>
 
       <input

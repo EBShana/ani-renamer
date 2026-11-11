@@ -50,6 +50,7 @@ export interface FileIdentify {
   needs_confirm?: boolean;
   ignored?: boolean;
   candidates?: IdentifyCandidate[];
+  reason?: string;
 }
 
 export interface ParsedFile {
@@ -74,13 +75,27 @@ export interface ParsedFile {
   source: string;
   status: "ok" | "warning";
   warnings: string[];
+  collection?: boolean;
+  collection_range?: string;
   fields: Record<string, string | number>;
   identify?: FileIdentify;
+  /** 命名规律分析留下的候选信息；只用于展示，不参与现有识别 */
+  pattern_candidate?: {
+    source?: string;
+    source_label?: string;
+    auto_applied?: boolean;
+    confirmed?: boolean;
+    values?: Record<string, unknown>;
+  } | null;
 }
 
 export interface ScanPayload {
   scan_id: string;
   root: string;
+  restored?: boolean;
+  restored_at?: string;
+  created_at?: string;
+  selections?: Record<string, string[]>;
   groups?: DirectoryGroup[];
   sources: string[];
   files: ParsedFile[];
@@ -96,11 +111,14 @@ export interface ScanPayload {
     special: number;
     movie: number;
     unknown: number;
+    collection: number;
   };
   truncated: boolean;
+  max_files?: number;
   ignored_dirs?: IgnoredDir[];
   markers_written?: number;
   is_sample?: boolean;
+  last_check?: RescanCheck | null;
 }
 
 export interface TemplateSpec {
@@ -149,8 +167,41 @@ export interface PresetInput {
   options?: PresetOptions;
 }
 
+export type QueueStage = "scan" | "match" | "preview" | "done";
+
+export interface QueueEntry {
+  entry_id: string;
+  stage: QueueStage;
+  group_id?: string;
+  work_id?: string | null;
+  work_key: string;
+  title: string;
+  year: number | null;
+  kind?: Kind | "unknown" | "asset";
+  category: Category;
+  file_ids: string[];
+  filename: string;
+  rel_path: string;
+  parent: string;
+  season: number | null;
+  episode: number | null;
+  is_folder: boolean;
+  needs_assign: boolean;
+  folder_key?: string | null;
+  result: { status: string; message: string } | null;
+}
+
+export interface QueueView {
+  entries: QueueEntry[];
+  counts: Record<QueueStage, number>;
+  groups: DirectoryGroup[];
+  total: number;
+  moved?: number;
+}
+
 export interface PreviewRow {
   file_id: string;
+  entry_id?: string | null;
   group_id?: string;
   original_path: string;
   new_path: string;
@@ -162,6 +213,38 @@ export interface PreviewRow {
   messages: string[];
 }
 
+export interface DuplicateFile {
+  file_id: string;
+  filename: string;
+  rel_path: string;
+  group_id: string;
+  version: string;
+  resolution: string;
+  excluded: boolean;
+  reason: string;
+  status?: string;
+}
+
+export interface DuplicateDecision {
+  action: "exclude" | "keep" | "keep_all" | "replace" | "reset" | string;
+  exclude: string[];
+  updated_at?: string;
+}
+
+export interface DuplicateGroup {
+  key: string;
+  work_id: string;
+  title: string;
+  year: number | null;
+  season: number;
+  episode: number;
+  kind: "multi_version" | "multi_source" | "parse_error" | string;
+  kind_label: string;
+  reason: string;
+  files: DuplicateFile[];
+  decision: DuplicateDecision | null;
+}
+
 export interface PreviewResponse {
   preset_id: string;
   preset_name: string;
@@ -169,6 +252,7 @@ export interface PreviewResponse {
   subtitle_mode: string;
   rows: PreviewRow[];
   summary: { ok: number; warning: number; error: number; skip: number };
+  duplicates?: DuplicateGroup[];
 }
 
 export interface ExecuteRow {
@@ -178,8 +262,16 @@ export interface ExecuteRow {
   category?: Category;
   original_path: string;
   target_path: string;
-  status: "done" | "skipped" | "failed" | "conflict" | "planned";
+  status: "done" | "skipped" | "failed" | "conflict" | "planned" | "merged";
   message: string;
+  choice?: string;
+}
+
+export interface ExecuteRisk {
+  code: string;
+  level: string;
+  message: string;
+  path: string;
 }
 
 export interface ExecuteResponse {
@@ -193,6 +285,8 @@ export interface ExecuteResponse {
   total?: number;
   batch_count?: number;
   message?: string;
+  needs_confirmation?: boolean;
+  risks?: ExecuteRisk[];
   counts?: { done: number; skipped: number; failed: number; conflict?: number; planned: number };
   rows?: ExecuteRow[];
 }
@@ -218,10 +312,62 @@ export interface OperationProgress {
   failed: number;
   conflict: number;
   planned: number;
+  merged: number;
   current_item: string;
   batch_index: number;
   batch_count: number;
   summary: OperationRecord["summary"];
+}
+
+export type ConflictAction =
+  | "skip"
+  | "overwrite"
+  | "suffix"
+  | "merge-skip"
+  | "merge-overwrite"
+  | "merge-suffix";
+
+export interface ConflictItem {
+  seq: number;
+  group_id?: string | null;
+  file_id?: string | null;
+  category?: Category;
+  original_path: string;
+  target_path: string;
+  status: string;
+  message: string;
+  choice?: string;
+}
+
+export interface ConflictView {
+  operation_id: string;
+  status: OperationStatus;
+  groups: { id: string; name: string }[];
+  files: ConflictItem[];
+  folders: ConflictItem[];
+  total: number;
+}
+
+export interface ResolutionStats {
+  file_skip: number;
+  file_overwrite: number;
+  file_suffix: number;
+  folder_skip: number;
+  folder_overwrite: number;
+  folder_suffix: number;
+  merge_folders: number;
+  merge_skip: number;
+  merge_overwrite: number;
+  merge_suffix: number;
+  merged_files: number;
+}
+
+export interface ResolveResponse {
+  operation_id: string;
+  status: string;
+  planned: number;
+  resolution: ResolutionStats;
+  skipped_unknown: string[];
 }
 
 export interface OperationRecord {
@@ -239,6 +385,9 @@ export interface OperationRecord {
     conflict?: number;
     conflict_policy?: string;
     source_operation?: string;
+    merged?: number;
+    remaining_source?: number;
+    resolution?: ResolutionStats;
   };
   created_at: string;
   undone_at: string | null;
@@ -282,6 +431,7 @@ export interface ConfigFieldSpec {
   group: string;
   description: string;
   options: string[];
+  option_labels?: string[];
 }
 
 export interface ConfigSchema {
@@ -331,6 +481,12 @@ export interface MatchCandidate {
   popularity: number;
 }
 
+export interface SeasonOption {
+  season_number: number;
+  name: string;
+  episode_count: number;
+}
+
 export interface MatchGroup {
   group_id: string;
   title: string;
@@ -340,12 +496,17 @@ export interface MatchGroup {
   episode_count: number;
   special_count: number;
   movie_count: number;
-  match: { tmdb_id: number | string; name: string } | null;
+  match: { tmdb_id: number | string; name: string; name_source?: string } | null;
   mixed_match: boolean;
   confidence?: string;
   needs_confirm?: boolean;
   source?: string;
   file_ids?: string[];
+  season_options?: SeasonOption[];
+  season_choice?: number | null;
+  season_mode?: "auto" | "manual" | "pending" | "default" | "unknown";
+  season_pending?: boolean;
+  season_recommended?: number | null;
 }
 
 export interface IdentifyWork {
@@ -363,6 +524,7 @@ export interface IdentifyWork {
   special_count: number;
   movie_count: number;
   matched: { tmdb_id: number | string; name: string } | null;
+  reason?: string;
 }
 
 export interface SuspectedGroup {
@@ -374,6 +536,7 @@ export interface SuspectedGroup {
   file_ids: string[];
   files: string[];
   count: number;
+  reason?: string;
 }
 
 export interface UnassignedFile {
@@ -382,6 +545,7 @@ export interface UnassignedFile {
   path: string;
   rel_path: string;
   group_id: string;
+  segment?: string;
   reason: string;
 }
 
@@ -395,12 +559,76 @@ export interface AssignmentRecord {
   updated_at?: string;
 }
 
+export interface AliasRecord {
+  id: string;
+  alias: string;
+  title: string;
+  year: number | null;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SpecialCandidate {
+  work_id: string;
+  title: string;
+  year: number | null;
+  score: number;
+  reason: string;
+}
+
+export interface SpecialSuggestion {
+  folder_key: string;
+  group_id: string;
+  rel_path: string;
+  name: string;
+  candidates: SpecialCandidate[];
+  confirmed: { work_id: string; title: string; year: number | null } | null;
+  reason: string;
+}
+
+export interface SpecialMemory {
+  id: string;
+  group_id: string;
+  rel_path: string;
+  work_id: string;
+  title: string;
+  year: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RescanCheck {
+  checked_at: string;
+  total: number;
+  ok: number;
+  moved: number;
+  missing: number;
+  entries_done: number;
+  entries_problem: number;
+}
+
+export interface CollectionItem {
+  file_id: string;
+  filename: string;
+  rel_path: string;
+  group_id: string;
+  collection_range: string;
+  work_id: string;
+  title: string;
+  season: number;
+  decision: { action: "keep" | "season"; season?: number } | null;
+}
+
 export interface IdentifyOverview {
   works: IdentifyWork[];
   pending: IdentifyWork[];
   suspected: SuspectedGroup[];
   unassigned: UnassignedFile[];
   assignments: AssignmentRecord[];
+  aliases: AliasRecord[];
+  special_suggestions: SpecialSuggestion[];
+  special_memory: SpecialMemory[];
+  collections: CollectionItem[];
   summary: {
     works: number;
     auto: number;
@@ -417,6 +645,8 @@ export interface MatchApplyResult {
     tmdb_id: number;
     media_type: "tv" | "movie";
     name: string;
+    name_source?: string;
+    name_source_label?: string;
     original_name: string;
     year: number | null;
     overview: string;
@@ -434,7 +664,7 @@ export interface AutoMatchResult {
   group_id: string;
   title: string;
   query: string;
-  status: "auto" | "choose" | "missing";
+  status: "auto" | "ai_pick" | "choose" | "missing";
   candidates: AutoMatchCandidate[];
   meta: MatchApplyResult["meta"] | null;
   updated: number;
@@ -445,7 +675,7 @@ export interface AutoMatchResult {
 export interface AutoMatchResponse {
   results: AutoMatchResult[];
   groups: MatchGroup[];
-  summary: { auto: number; choose: number; missing: number };
+  summary: { auto: number; ai_pick?: number; choose: number; missing: number };
   total: number;
 }
 
@@ -459,4 +689,269 @@ export interface RuleInfo {
   enabled: boolean;
   description: string;
   sample: string;
+  builtin?: boolean;
+}
+
+export interface RuleInput {
+  name: string;
+  scope: string;
+  kind: string;
+  priority: number;
+  regex: string;
+  enabled: boolean;
+  description: string;
+  sample: string;
+}
+
+export interface ScanRecord {
+  scan_id: string;
+  created_at: string;
+  updated_at: string;
+  file_count: number;
+}
+
+export interface MatchSearchResponse {
+  query: string;
+  source: string;
+  candidates: MatchCandidate[];
+  fallback?: MatchCandidate[];
+}
+
+export interface AiStatus {
+  enabled: boolean;
+  configured: boolean;
+  special_enabled?: boolean;
+  message: string;
+  batch_limit: number;
+}
+
+export interface AiSeasonSuggestion {
+  work_id: string;
+  season: number | null;
+  candidates: number[];
+  reason: string;
+  message: string;
+}
+
+export interface SeasonPlanGroup {
+  group_id: string;
+  title: string;
+  year: number | null;
+  current_season: number;
+  season_choice: number | null;
+  manual: boolean;
+  action: "assign" | "keep_manual" | "unresolved" | "invalid_clue" | "conflict";
+  proposed_season: number | null;
+  clue_text: string;
+  reason: string;
+  message: string;
+  episodes: number[];
+}
+
+export interface SeasonPlanCluster {
+  tmdb_id: string;
+  name: string;
+  seasons: { season_number: number; name: string; episode_count: number }[];
+  groups: SeasonPlanGroup[];
+  assignments: { group_id: string; title: string; season: number; reason: string }[];
+  manual: { group_id: string; title: string; season: number; message: string }[];
+  unresolved: { group_id: string; title: string; message: string }[];
+  looks_like: number[];
+  before_collisions: number;
+  collisions: { season: number; episode: number; groups: string[] }[];
+}
+
+export interface SeasonPlanResponse {
+  clusters: SeasonPlanCluster[];
+}
+
+export interface AiSpecialSuggestion {
+  folder_key: string;
+  rel_path: string;
+  work_id: string;
+  title: string;
+  year: number | null;
+  confidence: string;
+  reason: string;
+}
+
+export interface AiSpecialResponse {
+  suggestions: AiSpecialSuggestion[];
+  total: number;
+  considered: number;
+  message: string;
+}
+
+export interface AiIdentifySuggestion {
+  file_id: string;
+  filename: string;
+  folder: string;
+  segment: string;
+  title: string;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+  kind: string;
+  confidence: string;
+  reason: string;
+  tags: Record<string, string>;
+}
+
+export interface AiIdentifyResponse {
+  suggestions: AiIdentifySuggestion[];
+  total: number;
+  considered: number;
+  message: string;
+}
+
+export interface AiMatchSuggestion {
+  group_id: string;
+  current_title: string;
+  query: string;
+  title: string;
+  year: number | null;
+  media_type: "tv" | "movie";
+  confidence: string;
+  reason: string;
+}
+
+export interface AiMatchResponse {
+  suggestions: AiMatchSuggestion[];
+  total: number;
+  considered: number;
+  message: string;
+}
+
+export interface AiApplyItem {
+  file_ids: string[];
+  title: string;
+  year: number | null;
+  season: number | null;
+  episode: number | null;
+  kind: string;
+  segment: string;
+  remember_alias: boolean;
+}
+
+export interface AiApplyResponse {
+  applied: number;
+  remembered: number;
+  aliases: AliasRecord[];
+}
+
+// ---- 命名规律分析（一次只处理「目录组 + 子目录」） ----
+
+export interface PatternRule {
+  role: string;
+  container?: string;
+  match?: string;
+  take?: string;
+}
+
+export interface PatternStructure {
+  rules?: PatternRule[];
+  [key: string]: unknown;
+}
+
+export interface PatternCheckItem {
+  key: string;
+  label: string;
+  ok: boolean;
+  detail: string;
+  examples: string[];
+}
+
+export interface PatternFileValues {
+  kind?: string | null;
+  episode?: number | string | null;
+  season?: number | null;
+  special_no?: number | null;
+  version?: string | number | null;
+}
+
+export interface PatternSampleRow {
+  position: string;
+  file_id: string;
+  original: string;
+  new_name: string;
+  new_path: string;
+  status: string;
+  messages: string[];
+  evidence: string[];
+  suspects: string[];
+  builtin: PatternFileValues;
+  ai: PatternFileValues;
+  changed: boolean;
+}
+
+export type PatternDecisionValue = "adopted" | "rejected" | "later";
+
+export interface PatternDecisionRecord {
+  id: string;
+  group_id: string;
+  dir_rel: string;
+  decision: PatternDecisionValue;
+  decision_label: string;
+  note: string;
+  structure: PatternStructure;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PatternConflictValue {
+  builtin?: unknown;
+  ai?: unknown;
+}
+
+export interface PatternProposeResult {
+  status: "proposal" | "candidate_only" | "abandoned";
+  applied: boolean;
+  source_label: string;
+  target_count: number;
+  message: string;
+  attempts?: number;
+  limit?: number;
+  structure?: PatternStructure;
+  checks: PatternCheckItem[];
+  sample: PatternSampleRow[];
+  mismatched: string[];
+  conflicts?: Record<string, Record<string, PatternConflictValue>>;
+  decision?: PatternDecisionRecord | null;
+  remind?: boolean;
+}
+
+export interface PatternApplyResult {
+  status: string;
+  applied: boolean;
+  written: number;
+  skipped: number;
+  skipped_files?: string[];
+  cached: number;
+  source?: string;
+  source_label?: string;
+  message: string;
+  checks?: PatternCheckItem[];
+  conflicts?: Record<string, Record<string, PatternConflictValue>>;
+}
+
+export interface PatternCacheEntry {
+  id: string;
+  fingerprint: string;
+  group_id: string;
+  dir_rel: string;
+  structure: PatternStructure;
+  source: string;
+  source_label: string;
+  enabled: boolean;
+  hits: number;
+  created_at: string;
+  updated_at: string;
+  last_used_at: string;
+}
+
+export interface PatternCacheResponse {
+  auto_apply: boolean;
+  total: number;
+  entries: PatternCacheEntry[];
+  decisions: PatternDecisionRecord[];
 }

@@ -1,4 +1,4 @@
-"""作品识别第一步：文件名优先 + 目录回退 + 疑似作品 + 未归属。
+"""作品识别：以「视频所在上一级普通文件夹名」为准 + 文件名辅助。
 
 识别结果直接写回扫描记录里的每个视频文件：
 
@@ -6,7 +6,7 @@
         "work_id": "w:<组>:<标题>|<年份>",  # 空字符串表示还没归属
         "title": "...", "year": 2022,
         "confidence": "high" | "medium" | "low" | "none",
-        "source": "filename" | "folder" | "assignment" | "manual" | "none",
+        "source": "folder" | "filename" | "assignment" | "manual" | "alias" | "none",
         "segment": "用于记住映射的名称段",
         "needs_confirm": bool,
         "ignored": bool,
@@ -14,8 +14,11 @@
     }
 
 约定：
-- 只有 high（唯一确定）才自动套用并生成 work_id；
-- medium / low 不自动归属，聚合成“疑似作品”交给用户确认；
+- 作品名优先取上一级普通文件夹；`Season xx / SPs / Specials / CDs / Scans / Subs / Anime / TV`
+  等收纳目录会跳过，继续往上找；
+- 文件名只作为辅助信息：吻合时提高可信度，对不上时降级为「需要你确认」；
+- 只有 high（唯一确定）才自动生成 work_id，并标记为「待确认」；
+- medium / low 不自动归属，进入未归属区交给用户指派；
 - 未归属的文件不能在预览 / 执行里处理。
 """
 
@@ -25,33 +28,24 @@ import re
 import unicodedata
 from pathlib import PurePosixPath
 
-from .parser import OVA_DIR_NAMES, clean_dir_title
+from .lexicon import (
+    BUILTIN_GENERIC_DIRS,
+    EPISODE_MARKER_PATTERNS,
+    OVA_DIR_NAMES,
+    SEASON_DIR_NAME_RE,
+    VERSION_MARK_RE,
+    split_dir_names,
+    special_dir_name_set,
+)
+from .parser import clean_dir_title, strip_release_noise
 from .techname import BRACKET_RE, extract_year, is_tag_content
-
-SEASON_DIR_RE = re.compile(r"(?i)^(season\s*\d{1,2}|s\d{1,2}|第[0-9一二三四五六七八九十百零两]+季)$")
-
-BUILTIN_GENERIC_DIRS = {
-    "anime", "animation", "动画", "番剧", "tv", "movies", "movie", "media", "videos",
-    "video", "downloads", "download", "subs", "sub", "subtitles", "字幕", "fonts",
-    "cds", "scans", "sp", "sps", "specials", "special", "bonus", "extras", "menu",
-    "pv", "cm", "preview", "trailer", "ova", "ovas", "oad", "oads",
-}
 
 GENERIC_TITLE_WORDS = {
     "movie", "ova", "oad", "complete", "合集", "全集", "tv", "sp", "season",
     "special", "specials", "bonus", "extras", "vol", "volume", "part",
 }
 
-# 集号 / 特典标记：命中后从文件名里去掉
-_EPISODE_PATTERNS = [
-    re.compile(r"(?i)\bS\d{1,2}E\d{1,4}\b"),
-    re.compile(r"(?i)\bS\d{1,2}\b"),
-    re.compile(r"(?i)\b(?:EP|E)\.?\s?\d{1,4}\b"),
-    re.compile(r"(?i)\b(?:NCOP|NCED|PV|CM|MENU|SP|OVA|OAD)\s?\d{0,3}\b"),
-    re.compile(r"第\s*[0-9一二三四五六七八九十百零两]+\s*[话話集回]"),
-]
-_VERSION_RE = re.compile(r"(?i)(?<![A-Za-z])v\d{1,2}(?![A-Za-z])")
-_YEAR_RE = re.compile(r"(?:^|[^\d])((?:19|20)\d{2})(?:[^\d]|$)")
+_YEAR_RE = re.compile(r"(?<![0-9])((?:19|20)\d{2})(?![0-9])(?![xX]\d)(?![pP])")
 _SPLIT_RE = re.compile(r"[|/\\]+")
 
 
@@ -90,7 +84,7 @@ def _strip_known_group(stem: str) -> str:
 
     outside = BRACKET_RE.sub(" ", stem)
     outside = _YEAR_RE.sub(" ", outside)
-    for pattern in _EPISODE_PATTERNS:
+    for pattern in EPISODE_MARKER_PATTERNS:
         outside = pattern.sub(" ", outside)
     outside_ok = bool(re.search(r"[A-Za-z\u4e00-\u9fff]{2,}", outside))
 
@@ -131,15 +125,16 @@ def filename_segment(stem: str, episode: int | None = None) -> str:
     text = BRACKET_RE.sub(_bracket_repl, text)
     text = re.sub(r"[（(]([^）)]*)[）)]", _paren_repl, text)
 
-    for pattern in _EPISODE_PATTERNS:
+    for pattern in EPISODE_MARKER_PATTERNS:
         text = pattern.sub(" ", text)
 
     # 去掉“恰好等于已识别集号”的尾部数字（避免把作品名里的 100 当集号删掉）
     if isinstance(episode, int) and episode >= 0:
         text = re.sub(rf"(?<=\s|[-_.])0*{episode}(?![0-9])", " ", text)
 
-    text = _VERSION_RE.sub(" ", text)
+    text = VERSION_MARK_RE.sub(" ", text)
     text = _YEAR_RE.sub(" ", text)
+    text = strip_release_noise(text)
     text = text.replace("_", " ")
     text = _SPLIT_RE.sub(" ", text)
     text = re.sub(r"\s+", " ", text).strip(" -_.·:：@")
@@ -152,22 +147,14 @@ def filename_segment(stem: str, episode: int | None = None) -> str:
 
 
 def _generic_dirs(settings: dict) -> set[str]:
-    names = {
-        item.strip().lower()
-        for item in str(settings.get("parse.generic_dir_names", "")).split(",")
-        if item.strip()
-    }
-    names |= {
-        item.strip().lower()
-        for item in str(settings.get("parse.special_dir_names", "")).split(",")
-        if item.strip()
-    }
+    names = split_dir_names(settings.get("parse.generic_dir_names", ""))
+    names |= special_dir_name_set(settings.get("parse.special_dir_names", ""))
     return names | BUILTIN_GENERIC_DIRS | OVA_DIR_NAMES
 
 
 def _is_organizer_dir(name: str, generic: set[str]) -> bool:
     lowered = name.strip().lower()
-    return lowered in generic or bool(SEASON_DIR_RE.fullmatch(lowered))
+    return lowered in generic or bool(SEASON_DIR_NAME_RE.fullmatch(lowered))
 
 
 def folder_candidates(rel_path: str, settings: dict, min_length: int) -> list[str]:
@@ -205,15 +192,52 @@ def _assignment_index(assignments: list[dict]) -> dict[tuple[str, str], dict]:
     return index
 
 
-def apply_identification(scan: dict, assignments: list[dict], settings: dict) -> dict:
+def _alias_index(aliases: list[dict]) -> dict[str, list[dict]]:
+    """别名只做“规范化后完全相同”的匹配，绝不按相似度合并作品。"""
+    index: dict[str, list[dict]] = {}
+    for item in aliases:
+        alias = _norm(str(item.get("alias") or ""))
+        title = str(item.get("title") or "").strip()
+        if not alias or not title:
+            continue
+        bucket = index.setdefault(alias, [])
+        if not any(
+            _norm(str(existing.get("title") or "")) == _norm(title)
+            and existing.get("year") == item.get("year")
+            for existing in bucket
+        ):
+            bucket.append(item)
+    return index
+
+
+def _corroborating_folder(segment: str, folders: list[str]) -> str:
+    """文件名和目录名是否互相印证（完全相同，或一方完整包含另一方）。"""
+    target = _norm(segment)
+    if len(target) < 2:
+        return ""
+    for name in folders:
+        other = _norm(name)
+        if not other:
+            continue
+        if other == target or (len(other) >= 2 and other in target) or target in other:
+            return name
+    return ""
+
+
+def apply_identification(
+    scan: dict,
+    assignments: list[dict],
+    settings: dict,
+    aliases: list[dict] | None = None,
+) -> dict:
     """扫描完成后调用：给每个视频行写入 identify 信息，并同步 fields.series。"""
     files = scan.get("files") or []
     videos = [row for row in files if row.get("category") == "video"]
     min_length = int(settings.get("parse.min_title_length", 2) or 2)
     index = _assignment_index(assignments)
+    alias_index = _alias_index(aliases or [])
 
     folder_cache: dict[str, list[str]] = {}
-    parent_segments: dict[tuple[str, str], set[str]] = {}
     prepared: list[tuple[dict, str, str, list[str], str]] = []
 
     for row in videos:
@@ -231,20 +255,22 @@ def apply_identification(scan: dict, assignments: list[dict], settings: dict) ->
         if parent_rel not in folder_cache:
             folder_cache[parent_rel] = folder_candidates(rel, settings, min_length)
         folders = folder_cache[parent_rel]
-        if segment:
-            parent_segments.setdefault((group_id, parent_rel), set()).add(_norm(segment))
+        # 特典文件名通常只有 SP/NCOP/Menu 这类标记，不能当作作品名去和目录名“对不上”
+        if str(row.get("kind")) == "special" and folders:
+            segment = ""
         prepared.append((row, group_id, parent_rel, folders, segment))
 
     for row, group_id, parent_rel, folders, segment in prepared:
         fields = row.setdefault("fields", {})
 
+        folder_title = folders[0] if folders else ""
         candidates: list[dict] = []
-        if segment:
-            candidates.append({"title": segment, "source": "filename", "weight": 3})
         for depth, name in enumerate(folders):
             candidates.append(
-                {"title": name, "source": "folder", "weight": max(1.0, 2.0 - depth * 0.5)}
+                {"title": name, "source": "folder", "weight": max(1.0, 2.6 - depth * 0.6)}
             )
+        if segment:
+            candidates.append({"title": segment, "source": "filename", "weight": 2.2})
 
         year = row.get("year")
         if not isinstance(year, int):
@@ -252,28 +278,75 @@ def apply_identification(scan: dict, assignments: list[dict], settings: dict) ->
         if not isinstance(year, int):
             year = None
 
-        assignment = index.get((group_id, _norm(segment))) if segment else None
+        seg_norm = _norm(segment)
+        folder_norm = _norm(folder_title)
+        assignment = None
+        assignment_key = ""
+        if seg_norm and index.get((group_id, seg_norm)):
+            assignment = index[(group_id, seg_norm)]
+            assignment_key = segment
+        elif folder_norm and index.get((group_id, folder_norm)):
+            assignment = index[(group_id, folder_norm)]
+            assignment_key = folder_title
+
+        alias_matches = None
+        alias_key = ""
+        if seg_norm and alias_index.get(seg_norm):
+            alias_matches = alias_index[seg_norm]
+            alias_key = segment
+        elif folder_norm and alias_index.get(folder_norm):
+            alias_matches = alias_index[folder_norm]
+            alias_key = folder_title
+
+        reason = ""
         if assignment:
-            title = str(assignment.get("title") or segment)
+            title = str(assignment.get("title") or assignment_key)
             assigned_year = assignment.get("year")
             if isinstance(assigned_year, int):
                 year = assigned_year
             confidence = "high"
             source = "assignment"
-        elif segment:
-            # 同一目录里出现多个不同名称段时，说明“不确定”，必须交给用户选
-            same_parent = parent_segments.get((group_id, parent_rel), set())
-            confidence = "high" if folders and len(same_parent) <= 1 else "medium"
-            source = "filename"
-            title = segment
-        elif folders:
-            title = folders[0]
-            confidence = "low"
+            reason = (
+                f"记住的规则：名称「{assignment_key}」在目录组「{group_id}」里对应「{title}」"
+            )
+        elif alias_matches and len(alias_matches) == 1:
+            alias = alias_matches[0]
+            title = str(alias.get("title") or alias_key)
+            alias_year = alias.get("year")
+            if isinstance(alias_year, int):
+                year = alias_year
+            confidence = "high"
+            source = "alias"
+            reason = f"别名「{alias_key}」对应作品「{title}」（你之前确认过的写法）"
+        elif folder_title:
+            # 本轮的主要判定依据：上一级普通文件夹名
+            title = folder_title
             source = "folder"
+            corroborated = _corroborating_folder(segment, [folder_title]) if segment else ""
+            if segment and not corroborated:
+                confidence = "medium"
+                reason = (
+                    f"以上一级文件夹「{folder_title}」为准；文件名看起来是「{segment}」，"
+                    "两者对不上，需要你确认后才能改名"
+                )
+            else:
+                confidence = "high"
+                reason = (
+                    f"以上一级文件夹「{folder_title}」为准，文件名「{segment}」也与它一致"
+                    if segment
+                    else f"以上一级文件夹「{folder_title}」为准（文件名里没有可用的作品名）"
+                )
+        elif segment:
+            # 平铺在根目录，或者上级只有收纳目录：文件名降级为辅助信息
+            title = segment
+            confidence = "medium"
+            source = "filename"
+            reason = f"上级没有可用的作品文件夹，只能从文件名「{segment}」推断，需要你确认"
         else:
             title = ""
             confidence = "none"
             source = "none"
+            reason = "上级文件夹和文件名都没有足够信息"
 
         row["identify"] = {
             "work_id": "",
@@ -281,10 +354,11 @@ def apply_identification(scan: dict, assignments: list[dict], settings: dict) ->
             "year": year,
             "confidence": confidence,
             "source": source,
-            "segment": segment or (folders[0] if folders else ""),
-            "needs_confirm": confidence == "high" and source not in ("assignment", "manual"),
+            "segment": folder_title or segment,
+            "needs_confirm": confidence == "high" and source not in ("assignment", "manual", "alias"),
             "ignored": False,
             "candidates": candidates,
+            "reason": reason,
         }
         if title:
             fields["series"] = title
@@ -360,6 +434,7 @@ def build_overview(scan: dict) -> dict:
                     "special_count": 0,
                     "movie_count": 0,
                     "matched": None,
+                    "reason": str(ident.get("reason") or ""),
                 },
             )
             work["file_ids"].append(row.get("id"))
@@ -400,6 +475,7 @@ def build_overview(scan: dict) -> dict:
                     "files": [],
                     "count": 0,
                     "confidence": confidence,
+                    "reason": str(ident.get("reason") or ""),
                 },
             )
             entry["file_ids"].append(row.get("id"))
@@ -414,7 +490,8 @@ def build_overview(scan: dict) -> dict:
                 "path": row.get("path"),
                 "rel_path": row.get("rel_path"),
                 "group_id": str(row.get("group_id") or ""),
-                "reason": "文件名和目录名都没有足够信息",
+                "segment": str(ident.get("segment") or ""),
+                "reason": str(ident.get("reason") or "文件名和目录名都没有足够信息"),
             }
         )
 
@@ -434,7 +511,13 @@ def build_overview(scan: dict) -> dict:
                         "path": row.get("path"),
                         "rel_path": row.get("rel_path"),
                         "group_id": str(row.get("group_id") or ""),
-                        "reason": "只识别出候选名称，需要确认",
+                        "segment": str(
+                            (_row_identify(row) or {}).get("segment") or ""
+                        ),
+                        "reason": str(
+                            (_row_identify(row) or {}).get("reason")
+                            or "只识别出候选名称，需要确认"
+                        ),
                     }
                 )
 
@@ -499,10 +582,24 @@ def confirm_work(scan: dict, work_id: str) -> int:
     for row in scan.get("files") or []:
         if str(row.get("category")) != "video":
             continue
-        identify = _row_identify(row)
+        ident = _row_identify(row)
         if str(ident.get("work_id") or "") != work_id:
             continue
-        identify["needs_confirm"] = False
+        ident["needs_confirm"] = False
+        count += 1
+    return count
+
+
+def confirm_all(scan: dict) -> int:
+    """把「已指派待确认」里的作品一次全部确认；返回确认的文件条数。"""
+    count = 0
+    for row in scan.get("files") or []:
+        if str(row.get("category")) != "video":
+            continue
+        ident = _row_identify(row)
+        if not ident.get("work_id") or not ident.get("needs_confirm"):
+            continue
+        ident["needs_confirm"] = False
         count += 1
     return count
 
@@ -524,3 +621,180 @@ def ignore_segment(scan: dict, group_id: str, segment: str) -> int:
         identify["ignored"] = True
         count += 1
     return count
+
+
+def _folder_match_score(folder_name: str, work_title: str) -> tuple[int, str]:
+    """特典目录名与作品名的匹配强度：完全相同优先，其次是一方包含另一方。"""
+    folder = _norm(folder_name)
+    title = _norm(work_title)
+    if not folder or not title:
+        return 0, ""
+    if folder == title:
+        return 3, "目录名与作品名完全相同"
+    if title in folder:
+        return 2, f"目录名「{folder_name}」包含作品名「{work_title}」"
+    if folder in title:
+        return 2, f"作品名「{work_title}」包含目录名「{folder_name}」"
+    return 0, ""
+
+
+def special_suggestions(
+    scan: dict,
+    aliases: list[dict] | None = None,
+    min_length: int = 2,
+) -> list[dict]:
+    """为扫描时跳过的特典目录给出作品候选；只推荐，不自动套用。"""
+    works: dict[str, dict] = {}
+    # 目录结构索引：某个上级目录（含更上层）下出现过哪些作品。
+    subtree_works: dict[str, dict[str, dict]] = {}
+    for row in scan.get("files") or []:
+        if row.get("category") != "video":
+            continue
+        ident = _row_identify(row)
+        work_id = str(ident.get("work_id") or "")
+        title = str(ident.get("title") or "").strip()
+        if not work_id or not title:
+            continue
+        work = works.setdefault(
+            work_id,
+            {
+                "work_id": work_id,
+                "title": title,
+                "year": ident.get("year") if isinstance(ident.get("year"), int) else None,
+            },
+        )
+        parts = [part for part in str(row.get("rel_path") or "").split("/")[:-1] if part]
+        for depth in range(len(parts)):
+            subtree_works.setdefault("/".join(parts[:depth]), {}).setdefault(work_id, work)
+
+    alias_titles = {
+        (_norm(str(item.get("title") or "")), item.get("year")): str(item.get("alias") or "")
+        for item in (aliases or [])
+        if str(item.get("alias") or "").strip() and str(item.get("title") or "").strip()
+    }
+    decisions = scan.get("special_decisions") or {}
+    result: list[dict] = []
+
+    for item in scan.get("ignored_dirs") or []:
+        if not isinstance(item, dict) or str(item.get("reason") or "") != "special":
+            continue
+        gid = str(item.get("group_id") or "")
+        rel = str(item.get("path") or "").strip("/")
+        if not rel:
+            continue
+        folder_key = f"{gid}:{rel}"
+        names = [part for part in rel.split("/") if part]
+        candidates: list[dict] = []
+        for work in works.values():
+            best_score = 0
+            best_reason = ""
+            for name in names:
+                score, reason = _folder_match_score(name, work["title"])
+                if score > best_score:
+                    best_score, best_reason = score, reason
+            alias_text = alias_titles.get(
+                (_norm(work["title"]), work["year"])
+            ) or ""
+            if alias_text:
+                for name in names:
+                    score, reason = _folder_match_score(name, alias_text)
+                    if score >= 2 and score >= best_score:
+                        best_score = score
+                        best_reason = f"{reason}（这是作品「{work['title']}」的别名）"
+            if best_score:
+                candidates.append(
+                    {
+                        **work,
+                        "score": best_score,
+                        "reason": best_reason,
+                    }
+                )
+        # 目录结构兜底：特典目录所在的上级目录里如果只有一个作品，结构上只能是它
+        parent = "/".join(names[:-1])
+        siblings = subtree_works.get(parent) or {}
+        if len(siblings) == 1:
+            only = next(iter(siblings.values()))
+            if not any(entry["work_id"] == only["work_id"] for entry in candidates):
+                candidates.append(
+                    {
+                        **only,
+                        "score": 1,
+                        "reason": (
+                            f"特典目录的上级目录「{parent or '扫描根目录'}」里只有作品"
+                            f"「{only['title']}」，按目录结构归属"
+                        ),
+                    }
+                )
+        candidates.sort(key=lambda entry: (-int(entry["score"]), entry["title"]))
+        decision = decisions.get(folder_key) if isinstance(decisions, dict) else None
+        top = candidates[0] if candidates else None
+        if decision:
+            reason = f"你已经确认这个特典目录归属「{decision.get('title')}」"
+        elif top:
+            reason = f"{top['reason']}，请确认是否归到「{top['title']}」；不确认就保持原地"
+        else:
+            reason = "目录名对不上扫描到的任何作品，默认原地不动"
+        result.append(
+            {
+                "folder_key": folder_key,
+                "group_id": gid,
+                "rel_path": rel,
+                "name": rel.split("/")[-1],
+                "candidates": candidates,
+                "confirmed": decision,
+                "reason": reason,
+            }
+        )
+    result.sort(key=lambda entry: (entry["group_id"], entry["rel_path"]))
+    return result
+
+
+def apply_special_memory(scan: dict, entries: list[dict] | None) -> int:
+    """把记住的特典目录归属直接套用到本次扫描，不用再点一次确认。
+
+    只对本次扫描里确实存在、且用户还没手动改过的特典目录生效。
+    """
+    if not entries:
+        return 0
+    decisions = scan.setdefault("special_decisions", {})
+    known = {
+        (str(item.get("group_id") or ""), str(item.get("path") or "").strip("/"))
+        for item in scan.get("ignored_dirs") or []
+        if isinstance(item, dict) and str(item.get("reason") or "") == "special"
+    }
+    count = 0
+    for entry in entries:
+        key = (
+            str(entry.get("group_id") or ""),
+            str(entry.get("rel_path") or "").strip("/"),
+        )
+        if key not in known:
+            continue
+        folder_key = f"{key[0]}:{key[1]}"
+        if folder_key in decisions:
+            continue
+        decisions[folder_key] = {
+            "work_id": str(entry.get("work_id") or ""),
+            "title": str(entry.get("title") or ""),
+            "year": entry.get("year") if isinstance(entry.get("year"), int) else None,
+            "remembered": True,
+        }
+        count += 1
+    return count
+
+
+def assign_special_folder(
+    scan: dict, folder_key: str, work_id: str, title: str, year: int | None
+) -> None:
+    decisions = scan.setdefault("special_decisions", {})
+    decisions[folder_key] = {
+        "work_id": work_id,
+        "title": title,
+        "year": year,
+    }
+
+
+def clear_special_folder(scan: dict, folder_key: str) -> None:
+    decisions = scan.get("special_decisions")
+    if isinstance(decisions, dict):
+        decisions.pop(folder_key, None)

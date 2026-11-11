@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field as dc_field
 
+from .lexicon import DIR_SPECIAL_RULE_NAMES
+
 CHINESE_NUMERALS = {
     "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
     "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
@@ -47,6 +49,60 @@ class Rule:
         }
 
 
+SCOPES = ("filename", "dirname")
+KINDS = ("episode", "special", "movie", "season", "any")
+
+_REGEX_HINTS = {
+    "unterminated character set": "方括号 [ ] 没有闭合",
+    "missing ), unterminated subpattern": "圆括号 ( ) 没有闭合",
+    "unbalanced parenthesis": "圆括号 ( ) 多了一个或位置不对",
+    "nothing to repeat": "? * + 等重复符号前面没有可重复的内容",
+    "bad character range": "字符范围写法不对，例如 [a-z] 的中间必须是短横线",
+    "bad escape": "反斜杠后面的转义写法不合法",
+}
+
+
+def _regex_message(exc: re.error) -> str:
+    detail = str(exc)
+    hint = ""
+    for key, text in _REGEX_HINTS.items():
+        if key in detail:
+            hint = text
+            break
+    position = getattr(exc, "pos", None)
+    where = f"，出错位置大约在第 {position + 1} 个字符" if isinstance(position, int) else ""
+    reason = hint or detail
+    return f"正则表达式不合法：{reason}{where}。请检查括号是否成对、重复符号前是否有内容。"
+
+
+def validate_rule_payload(payload: dict) -> list[str]:
+    """检查用户提交的规则；返回中文错误列表，空列表表示通过。"""
+    errors: list[str] = []
+    if not str(payload.get("name") or "").strip():
+        errors.append("规则名称不能为空")
+    scope = str(payload.get("scope") or "")
+    if scope not in SCOPES:
+        errors.append("适用范围只能是文件名或目录名")
+    kind = str(payload.get("kind") or "")
+    if kind not in KINDS:
+        errors.append("识别类型不合法，只能是集号、特典、剧场版、季或任意")
+    try:
+        priority = int(payload.get("priority") or 0)
+    except (TypeError, ValueError):
+        priority = -1
+    if priority < 0 or priority > 200:
+        errors.append("优先级必须是 0 到 200 之间的整数")
+    regex = str(payload.get("regex") or "").strip()
+    if not regex:
+        errors.append("正则表达式不能为空")
+    else:
+        try:
+            re.compile(regex)
+        except re.error as exc:
+            errors.append(_regex_message(exc))
+    return errors
+
+
 BUILTIN_RULES: list[Rule] = [
     # ---- 文件名 ----
     Rule(
@@ -68,6 +124,16 @@ BUILTIN_RULES: list[Rule] = [
         r"(?i)(?<![A-Za-z])(?P<special_type>special|ncoped|ncop|nced|ova|oad|teaser|preview|menu|sp|pv|cm)[\s_.-]*(?P<special_no>\d{1,3})?",
         description="识别特典类型与序号，允许后续规则补充集号",
         sample="[Group] Frieren - NCOP01 [1080p]",
+    ),
+    Rule(
+        "fn-cn-op-ed",
+        "全角 OP / ED 特典",
+        "filename",
+        "special",
+        11,
+        r"(?i)【\s*(?P<special_type>OP|ED)(?:[-\s]?(?P<special_no>\d{1,2}))?\s*】",
+        description="【OP】【ED】这类片头片尾按特典处理，带序号（OP01）和不带序号（OP）都认",
+        sample="【Disc-41】【OP】【DVDrip】[x264 Hi10p AAC][MP4]",
     ),
     Rule(
         "fn-sxxexx",
@@ -124,6 +190,16 @@ BUILTIN_RULES: list[Rule] = [
         sample="[Group][Frieren][01][1080p]",
     ),
     Rule(
+        "fn-cn-bracket-episode",
+        "全角方括号集号（开头）",
+        "filename",
+        "episode",
+        31,
+        r"^\s*【\s*(?P<episode>\d{1,3})(?:v(?P<version>\d))?\s*】",
+        description="只认文件名开头的 【001】；4 位数字（年份）不认，标题中间的【2】也不认",
+        sample="【001】【游戏的继承者】【DVDrip】[x264 Hi10p AAC][MP4]",
+    ),
+    Rule(
         "fn-dash-episode",
         "破折号集号",
         "filename",
@@ -148,7 +224,7 @@ BUILTIN_RULES: list[Rule] = [
         "dirname",
         "special",
         5,
-        r"(?i)^(sp|sps|special|specials|extra|extras|menu|menus|preview|previews|ncop|nced|cd|cds|scan|scans|bonus|特典|映像特典|特别篇|花絮)$",
+        r"(?i)^(" + "|".join(DIR_SPECIAL_RULE_NAMES) + r")$",
         sample="特典 / SPs / Specials",
     ),
     Rule(

@@ -19,6 +19,18 @@ ARCHIVE_EXTENSIONS = frozenset({
     ".7z", ".zip", ".rar", ".tar", ".gz", ".bz2", ".xz",
 })
 
+# 特典目录里只可能是素材、不可能是视频的扩展名：用来快速跳过，避免逐个 stat
+ASSET_ONLY_EXTENSIONS = (
+    SUBTITLE_EXTENSIONS
+    | AUDIO_EXTENSIONS
+    | IMAGE_EXTENSIONS
+    | ARCHIVE_EXTENSIONS
+    | frozenset({
+        ".pdf", ".txt", ".nfo", ".log", ".json", ".xml", ".html", ".url",
+        ".ttf", ".otf", ".woff", ".woff2", ".exe", ".db", ".md5", ".sfv",
+    })
+)
+
 CATEGORY_LABELS: dict[str, str] = {
     "video": "视频",
     "subtitle": "字幕",

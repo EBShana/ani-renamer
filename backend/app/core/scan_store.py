@@ -1,4 +1,8 @@
-"""扫描结果会话存储与内置样例数据。"""
+"""扫描结果会话存储与内置样例数据。
+
+第 10 步起，扫描结果写入 SQLite（scans 表），容器重启后仍然可以接着用；
+内存里保留一份缓存，避免每次读取都反序列化 JSON。
+"""
 
 from __future__ import annotations
 
@@ -7,6 +11,12 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
+from ..store import (
+    delete_scan_record,
+    list_scan_records,
+    load_scan_record,
+    save_scan_record,
+)
 from .identify import apply_identification
 from .parser import parse_file
 from .rules import Rule
@@ -30,30 +40,66 @@ def put_scan(payload: dict) -> str:
     scan_id = f"scan-{uuid.uuid4().hex[:12]}"
     payload["scan_id"] = scan_id
     payload["created_at"] = datetime.now(timezone.utc).isoformat()
+    payload["restored"] = False
     with _LOCK:
         _SESSIONS[scan_id] = payload
+    save_scan_record(payload)
     return scan_id
+
+
+def save_scan(payload: dict) -> None:
+    """扫描内容有改动（勾选、阶段、识别）时调用，把最新状态写回 SQLite。"""
+    with _LOCK:
+        scan_id = str(payload.get("scan_id") or "")
+        if scan_id:
+            _SESSIONS[scan_id] = payload
+    save_scan_record(payload)
 
 
 def get_scan(scan_id: str) -> dict | None:
     with _LOCK:
-        return _SESSIONS.get(scan_id)
+        cached = _SESSIONS.get(scan_id)
+        if cached is not None:
+            return cached
+    data = load_scan_record(scan_id)
+    if data is None:
+        return None
+    # 从数据库恢复：明确标记“这是上次的扫描”，前端据此提示可能已过时。
+    data["restored"] = True
+    data["restored_at"] = datetime.now(timezone.utc).isoformat()
+    with _LOCK:
+        _SESSIONS[scan_id] = data
+    return data
+
+
+def delete_scan(scan_id: str) -> bool:
+    with _LOCK:
+        _SESSIONS.pop(scan_id, None)
+    return delete_scan_record(scan_id)
+
+
+def list_scans(limit: int = 20) -> list[dict]:
+    return list_scan_records(limit)
 
 
 def apply_field_updates(scan_id: str, updates: dict[str, dict]) -> int:
     """把匹配结果写回扫描缓存，供后续预览与重命名使用。"""
     with _LOCK:
         payload = _SESSIONS.get(scan_id)
-        if not payload:
-            return 0
-        count = 0
-        for row in payload.get("files", []):
-            patch = updates.get(str(row.get("id")))
-            if not patch:
-                continue
-            row.setdefault("fields", {}).update(patch)
-            count += 1
-        return count
+    if not payload:
+        payload = get_scan(scan_id)
+    if not payload:
+        return 0
+    count = 0
+    for row in payload.get("files", []):
+        patch = updates.get(str(row.get("id")))
+        if not patch:
+            continue
+        row.setdefault("fields", {}).update(patch)
+        count += 1
+    if count:
+        save_scan(payload)
+    return count
 
 
 def build_samples(settings: dict, rules: list[Rule], assignments: list[dict] | None = None) -> dict:
@@ -82,12 +128,15 @@ def build_samples(settings: dict, rules: list[Rule], assignments: list[dict] | N
         "special": 0,
         "movie": 0,
         "unknown": 0,
+        "collection": 0,
     }
     for row in files:
         category = str(row.get("category") or "other")
         if category in stats:
             stats[category] += 1
         if row.get("category") == "video":
+            if row.get("collection"):
+                stats["collection"] += 1
             stats[row["kind"] if row["kind"] in stats else "unknown"] += 1
     return {
         "scan_id": "sample",

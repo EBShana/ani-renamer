@@ -7,12 +7,24 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .core.lexicon import (
+    DEFAULT_GENERIC_DIR_NAMES,
+    DEFAULT_SPECIAL_DIR_NAMES,
+    DEFAULT_SPECIALS_DIR_NAME,
+)
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 CONFIG_DIR = Path(os.environ.get("APP_CONFIG_DIR") or (BASE_DIR / "data"))
 DB_PATH = Path(os.environ.get("APP_DB_PATH") or (CONFIG_DIR / "app.db"))
 CONFIG_FILE = CONFIG_DIR / "settings.json"
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
+
+# 特典类目录名默认值。EXTRA / Extras 这类写法也算特典目录：
+# 默认（选项 A）整个目录跟着作品搬走，目录名和内部结构不变，视频/字幕不改名。
+# 旧的 v3 默认值（没有 EXTRA）只用于识别“用户没改过”，升级时自动补上 EXTRA。
+OLD_SPECIAL_DIR_DEFAULT = "SPs,Specials,特典,映像特典,CDs,Scans,Bonus,Extras,Menu,PV,CM,Preview,Trailer"
+NEW_SPECIAL_DIR_DEFAULT = DEFAULT_SPECIAL_DIR_NAMES
 
 _lock = threading.Lock()
 
@@ -26,12 +38,15 @@ class SettingSpec:
     group: str
     description: str = ""
     options: tuple[str, ...] = ()
+    option_labels: tuple[str, ...] = ()
+    min_value: int | None = None
+    max_value: int | None = None
 
 
 SETTING_GROUPS: list[tuple[str, str]] = [
     ("parse", "识别"),
     ("naming", "命名"),
-    ("providers", "元数据源"),
+    ("providers", "元数据源与 AI"),
     ("execution", "执行"),
     ("scraper", "刮削（预留）"),
 ]
@@ -57,7 +72,7 @@ SETTING_SPECS: list[SettingSpec] = [
         "parse.generic_dir_names",
         "通用目录名（逗号分隔）",
         "string",
-        "Anime,动画,番剧,TV,Movies,Media,media,Videos,Downloads,Download,特典,SPs,Specials,Scans,CDs",
+        DEFAULT_GENERIC_DIR_NAMES,
         "parse",
         "这些目录名不会被当作作品标题",
     ),
@@ -98,9 +113,10 @@ SETTING_SPECS: list[SettingSpec] = [
         "parse.special_dir_names",
         "特典类目录名（逗号分隔）",
         "string",
-        "SPs,Specials,特典,映像特典,CDs,Scans,Bonus,Extras,Menu,PV,CM,Preview,Trailer",
+        NEW_SPECIAL_DIR_DEFAULT,
         "parse",
-        "命中这些名字的目录会被忽略（不区分大小写）",
+        "命中这些名字的目录会被当作特典文件夹，按「特典文件夹里的视频」设置处理"
+        "（不区分大小写；EXTRA / Extras 也算特典目录）",
     ),
     SettingSpec(
         "parse.ignore_marker_files",
@@ -116,7 +132,19 @@ SETTING_SPECS: list[SettingSpec] = [
         "bool",
         True,
         "parse",
-        "扫描时在特典类目录里创建空标记文件（已存在则跳过）",
+        "文件移动完成后，在目标目录里创建空标记文件（已存在则跳过）。"
+        "特典视频选 B 时不写标记。",
+    ),
+    SettingSpec(
+        "parse.max_files",
+        "单次扫描最多文件数",
+        "int",
+        20000,
+        "parse",
+        "达到上限后会停止扫描并提示还有文件未扫描。范围 1~100000。"
+        "调高会明显增加内存占用、扫描时间和后续 TMDB 请求量，建议配合扫描结果持久化使用。",
+        min_value=1,
+        max_value=100000,
     ),
     SettingSpec(
         "naming.subtitle_mode",
@@ -147,7 +175,7 @@ SETTING_SPECS: list[SettingSpec] = [
         "naming.specials_dir",
         "特典季目录名",
         "string",
-        "Season 00",
+        DEFAULT_SPECIALS_DIR_NAME,
         "naming",
         "特典文件放进哪个季目录，可自定义；默认 Season 00（主流媒体库推荐）",
     ),
@@ -203,6 +231,22 @@ SETTING_SPECS: list[SettingSpec] = [
         "例如 zh-CN / ja-JP / en-US",
     ),
     SettingSpec(
+        "metadata.name_language_order",
+        "作品名语言优先级",
+        "select",
+        "cn_tw_jp_en",
+        "providers",
+        "TMDB 没有简体中文名时，按这个顺序找替代。"
+        "判断标准：简体名称为空，或与原名相同（说明 TMDB 没有简体翻译）。"
+        "作品名始终取自 TMDB 返回值，AI 不参与命名。",
+        ("cn_tw_jp_en", "cn_jp_tw_en", "cn_tw_en_jp"),
+        option_labels=(
+            "简体 → 繁体 → 日文原名 → 英文（推荐）",
+            "简体 → 日文原名 → 繁体 → 英文",
+            "简体 → 繁体 → 英文 → 日文原名",
+        ),
+    ),
+    SettingSpec(
         "providers.bangumi_token",
         "Bangumi Token",
         "secret",
@@ -211,12 +255,73 @@ SETTING_SPECS: list[SettingSpec] = [
         "可选，用于提高 Bangumi 请求限额",
     ),
     SettingSpec(
+        "providers.ai_enabled",
+        "启用 AI 辅助",
+        "bool",
+        False,
+        "providers",
+        "「一键自动匹配 TMDB」卡住时（本地搜不到，或候选分不清）才会自动问 AI；"
+        "AI 只提供搜索关键词或从候选里挑编号，作品名始终取 TMDB 返回值。"
+        "其它 AI 功能仍然只在你手动点击时调用。只发送文件名、目录名、候选标题等文本，绝不发送文件内容。",
+    ),
+    SettingSpec(
+        "providers.ai_base_url",
+        "AI 接口地址",
+        "string",
+        "",
+        "providers",
+        "OpenAI 兼容接口地址，例如 http://host.docker.internal:11434/v1（本地 Ollama）"
+        "或 https://api.openai.com/v1。留空表示未配置。",
+    ),
+    SettingSpec(
+        "providers.ai_api_key",
+        "AI API Key",
+        "secret",
+        "",
+        "providers",
+        "本地模型通常可以留空；在线服务请填写。Key 不会出现在日志、接口响应或界面提示里。",
+    ),
+    SettingSpec(
+        "providers.ai_model",
+        "AI 模型名",
+        "string",
+        "gpt-4o-mini",
+        "providers",
+        "填进请求里的 model 字段，例如 gpt-4o-mini、qwen2.5:7b。",
+    ),
+    SettingSpec(
+        "providers.ai_batch_limit",
+        "AI 每次最多处理条数",
+        "int",
+        10,
+        "providers",
+        "一次请求最多打包多少个文件或作品，避免一次问太多。范围 1~50。",
+    ),
+    SettingSpec(
+        "providers.ai_special_enabled",
+        "AI 特典归属判断",
+        "bool",
+        True,
+        "providers",
+        "开启后，「匹配作品」页的特典归属候选可以点「AI 判断」请求建议；"
+        "仍然只在你手动点击时调用，AI 只给建议，不确认不生效。",
+    ),
+    SettingSpec(
+        "providers.ai_pattern_cache_auto_apply",
+        "AI 规律缓存自动套用",
+        "bool",
+        True,
+        "providers",
+        "指纹完全一致时，自动使用已确认过的 AI 命名规律，并在结果里标明「缓存命中」；"
+        "指纹有任何不同都只作为候选展示。关闭后即使指纹一致也不自动套用。",
+    ),
+    SettingSpec(
         "execution.conflict_policy",
         "冲突处理",
         "select",
         "skip",
         "execution",
-        "目标文件已存在时的策略",
+        "目标文件已存在时的策略（第 6 步起改为执行结束后统一在冲突面板处理，此设置暂不使用）",
         ("skip", "overwrite", "suffix"),
     ),
     SettingSpec(
@@ -237,6 +342,98 @@ SETTING_SPECS: list[SettingSpec] = [
         ("move", "keep"),
     ),
     SettingSpec(
+        "execution.special_video_policy",
+        "特典文件夹里的视频",
+        "select",
+        "root",
+        "execution",
+        "CDs、SPs、EXTRA 这类特典文件夹怎么处理。"
+        "A 推荐：整个文件夹跟着作品搬走，文件夹名和内部结构不变，视频、字幕都不改名；"
+        "B：把里面的视频放进 Season 00，按特典模板改名。",
+        ("root", "season"),
+        option_labels=(
+            "A：整个特典文件夹跟作品搬走（内部不改名）",
+            "B：视频放进 Season 00（按特典模板改名）",
+        ),
+    ),
+    SettingSpec(
+        "execution.special_folder_conflict",
+        "多季同名素材文件夹",
+        "select",
+        "season",
+        "execution",
+        "同一部作品有多季、每季都带 CDs / Scans / SPs 时，整目录搬会撞到同一个作品目录。"
+        "「加季号区分」只在确实撞名时生效，没撞名的保持原名；"
+        "「合并」则让它们都进同一个文件夹（同名文件执行时按冲突策略处理）。",
+        ("season", "merge"),
+        option_labels=(
+            "加季号区分（推荐）",
+            "合并进同一个文件夹",
+        ),
+    ),
+    SettingSpec(
+        "naming.special_folder_suffix",
+        "撞名素材文件夹命名格式",
+        "string",
+        "{name} {source_season}",
+        "naming",
+        "撞名时素材文件夹的新名字。可用变量：{name}=原文件夹名，{source_season}=S01，"
+        "{season}=1（写 {season:02} 得到 01）。"
+        "例：{name} [{source_season}] → CDs [S01]；{source_season} {name} → S01 CDs。",
+    ),
+    SettingSpec(
+        "execution.batch_size",
+        "每批处理数量",
+        "int",
+        100,
+        "execution",
+        "执行时每批处理多少个条目，再进入下一批。范围 1~1000。"
+        "网盘场景建议调小（例如 10），减少单批失败重试的代价。",
+        min_value=1,
+        max_value=1000,
+    ),
+    SettingSpec(
+        "execution.batch_delay_seconds",
+        "批与批之间的等待秒数",
+        "int",
+        0,
+        "execution",
+        "每批结束后等待多少秒再处理下一批，避免网盘客户端同时处理太多请求。范围 0~600。",
+        min_value=0,
+        max_value=600,
+    ),
+    SettingSpec(
+        "execution.retry_times",
+        "失败重试次数",
+        "int",
+        0,
+        "execution",
+        "单个文件移动失败后最多再试几次（0 表示不重试）。范围 0~5。",
+        min_value=0,
+        max_value=5,
+    ),
+    SettingSpec(
+        "execution.retry_backoff_seconds",
+        "重试间隔秒数",
+        "int",
+        3,
+        "execution",
+        "每次重试前等待的秒数，会按次数递增（第 1 次等 1 倍、第 2 次等 2 倍……）。范围 0~60。",
+        min_value=0,
+        max_value=60,
+    ),
+    SettingSpec(
+        "execution.network_drive_mode",
+        "网盘模式",
+        "bool",
+        False,
+        "execution",
+        "媒体放在网盘（WebDAV / 云盘挂载）时打开，降低单位时间的读盘请求，避免触发风控。"
+        "打开时会把「每批处理数量 / 批间隔 / 重试次数 / 重试间隔」改写为推荐值，之后仍可单独微调；"
+        "扫描会复用目录列表、不再为标记文件额外探测，执行会去重重复的 mkdir 与空目录检查。"
+        "关闭后恢复常规行为。结果、命名与撤销能力在两种模式下完全一致。",
+    ),
+    SettingSpec(
         "scraper.enabled",
         "启用刮削（预留）",
         "bool",
@@ -251,11 +448,26 @@ def _defaults() -> dict[str, Any]:
     return {spec.key: spec.default for spec in SETTING_SPECS}
 
 
+# 打开「网盘模式」时一次性写入的低 IO 推荐值；之后用户可单独修改，不会被反复覆盖。
+NETWORK_DRIVE_DEFAULTS: dict[str, Any] = {
+    "execution.batch_size": 10,
+    "execution.batch_delay_seconds": 2,
+    "execution.retry_times": 1,
+    "execution.retry_backoff_seconds": 10,
+}
+
+
 def load_settings() -> dict[str, Any]:
     values = _defaults()
+    stored_version = 0
     if CONFIG_FILE.exists():
         try:
             raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                try:
+                    stored_version = int(raw.get("version") or 0)
+                except (TypeError, ValueError):
+                    stored_version = 0
             stored = raw.get("values") if isinstance(raw, dict) else None
             if isinstance(stored, dict):
                 for key, value in stored.items():
@@ -263,6 +475,12 @@ def load_settings() -> dict[str, Any]:
                         values[key] = value
         except (json.JSONDecodeError, OSError):
             pass
+    # 只升级“完全没改过”的旧默认值：用户自己改过的列表保持原样。
+    if str(values.get("parse.special_dir_names") or "").strip() == OLD_SPECIAL_DIR_DEFAULT:
+        values["parse.special_dir_names"] = NEW_SPECIAL_DIR_DEFAULT
+    if stored_version < 4 and values.get("providers.ai_special_enabled") is False:
+        # v3 及更早的「AI 特典识别」只是占位开关、从未生效，升级后默认打开（仍只手动触发）
+        values["providers.ai_special_enabled"] = True
     return values
 
 
@@ -284,9 +502,16 @@ PRESET_OPTION_KEYS: dict[str, str] = {
     "write_ignore_markers": "parse.write_ignore_markers",
     "default_season": "parse.default_season",
     "special_season_zero": "parse.special_season_zero",
+    "special_folder_suffix": "naming.special_folder_suffix",
     "conflict_policy": "execution.conflict_policy",
     "keep_empty_dirs": "execution.keep_empty_dirs",
     "asset_policy": "execution.asset_policy",
+    "special_video_policy": "execution.special_video_policy",
+    "special_folder_conflict": "execution.special_folder_conflict",
+    "batch_size": "execution.batch_size",
+    "batch_delay_seconds": "execution.batch_delay_seconds",
+    "retry_times": "execution.retry_times",
+    "retry_backoff_seconds": "execution.retry_backoff_seconds",
 }
 
 
@@ -333,21 +558,87 @@ def _coerce(spec: SettingSpec, value: Any) -> Any:
     return "" if value is None else str(value)
 
 
+def _coerce_strict(spec: SettingSpec, value: Any) -> Any:
+    """保存设置时用：范围或类型不对就抛中文错误，不静默改成默认值。"""
+    if spec.type == "int":
+        try:
+            number = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"「{spec.label}」必须是整数") from exc
+        low, high = spec.min_value, spec.max_value
+        if (low is not None and number < low) or (high is not None and number > high):
+            if low is not None and high is not None:
+                raise ValueError(
+                    f"「{spec.label}」超出允许范围（{low}~{high}），请填写范围内的整数"
+                )
+            raise ValueError(f"「{spec.label}」超出允许范围")
+        return number
+    if spec.type == "select":
+        if value not in spec.options:
+            raise ValueError(f"「{spec.label}」不是可选项：{value}")
+        return value
+    if spec.type == "bool":
+        return bool(value)
+    return "" if value is None else str(value)
+
+
+def _read_raw_config() -> dict[str, Any]:
+    if not CONFIG_FILE.exists():
+        return {}
+    try:
+        raw = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
 def save_settings(values: dict[str, Any]) -> dict[str, Any]:
     with _lock:
         current = load_settings()
+        was_network_mode = bool(current.get("execution.network_drive_mode"))
         by_key = {spec.key: spec for spec in SETTING_SPECS}
         for key, value in values.items():
             spec = by_key.get(key)
             if spec is not None:
-                current[key] = _coerce(spec, value)
+                current[key] = _coerce_strict(spec, value)
+        # 只在“刚刚打开”的那一次写入推荐值；已经在网盘模式下保存设置时，
+        # 用户自己调过的批大小 / 间隔不会被覆盖。
+        if current.get("execution.network_drive_mode") and not was_network_mode:
+            current.update(NETWORK_DRIVE_DEFAULTS)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"version": CONFIG_VERSION, "values": current}
+        # 保留 auth 等非设置字段（例如访问密码哈希），避免保存设置时被覆盖
+        raw = _read_raw_config()
+        payload = {**raw, "version": CONFIG_VERSION, "values": current}
         CONFIG_FILE.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
     return current
+
+
+def read_auth_hash() -> str:
+    """访问密码哈希；存在 settings.json 的 auth.password_hash，不属于普通设置项。"""
+    raw = _read_raw_config()
+    auth = raw.get("auth") if isinstance(raw.get("auth"), dict) else {}
+    return str(auth.get("password_hash") or "")
+
+
+def write_auth_hash(password_hash: str | None) -> None:
+    """写入或清除访问密码哈希（None / 空字符串表示关闭密码）。"""
+    with _lock:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        raw = _read_raw_config()
+        auth = raw.get("auth") if isinstance(raw.get("auth"), dict) else {}
+        if password_hash:
+            auth["password_hash"] = password_hash
+            raw["auth"] = auth
+        else:
+            raw.pop("auth", None)
+        raw.setdefault("version", CONFIG_VERSION)
+        CONFIG_FILE.write_text(
+            json.dumps(raw, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
 
 def get_media_root() -> Path:
@@ -370,6 +661,9 @@ def config_schema() -> dict[str, Any]:
                 "group": spec.group,
                 "description": spec.description,
                 "options": list(spec.options),
+                "option_labels": list(spec.option_labels),
+                "min": spec.min_value,
+                "max": spec.max_value,
             }
             for spec in SETTING_SPECS
         ],

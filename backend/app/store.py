@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import uuid
@@ -25,9 +26,14 @@ from .config import (
 from .core.groups import normalize_group, validate_groups
 from .core.rules import BUILTIN_RULES, Rule
 
-PRESETS_VERSION = 3
+PRESETS_VERSION = 6
 GROUPS_VERSION = 1
 ASSIGNMENTS_VERSION = 1
+ALIASES_VERSION = 1
+
+# 扫描结果持久化：只保留最近若干次，避免 SQLite 无限膨胀。
+SCAN_KEEP_LATEST = 10
+SCAN_TTL_DAYS = 14
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -63,18 +69,62 @@ CREATE TABLE IF NOT EXISTS operation_items (
     status TEXT NOT NULL,
     message TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS scans (
+    scan_id TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    file_count INTEGER NOT NULL DEFAULT 0,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auth_sessions (
+    token_hash TEXT PRIMARY KEY,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
 """
 
 PRESETS_FILE = CONFIG_DIR / "presets.json"
 RULES_FILE = CONFIG_DIR / "rules.json"
 GROUPS_FILE = CONFIG_DIR / "groups.json"
 ASSIGNMENTS_FILE = CONFIG_DIR / "assignments.json"
+ALIASES_FILE = CONFIG_DIR / "aliases.json"
+SPECIAL_MEMORY_FILE = CONFIG_DIR / "special_memory.json"
+SPECIAL_MEMORY_VERSION = 1
+PATTERN_CACHE_FILE = CONFIG_DIR / "pattern_cache.json"
+PATTERN_CACHE_VERSION = 1
+PATTERN_DECISIONS_FILE = CONFIG_DIR / "pattern_decisions.json"
+PATTERN_DECISIONS_VERSION = 1
+PATTERN_DECISIONS = ("adopted", "rejected", "later")
+PATTERN_DECISION_LABELS = {
+    "adopted": "采用",
+    "rejected": "不采用",
+    "later": "稍后再说",
+}
+# 缓存条目的来源：AI 首次生成 / 用户手动改过 / 从别的指纹命中后写入
+PATTERN_SOURCES = ("ai", "manual", "cache_hit")
+PATTERN_SOURCE_LABELS = {
+    "ai": "AI 生成",
+    "manual": "用户手动修改",
+    "cache_hit": "从缓存命中",
+}
 
 _LOCK = threading.RLock()
 
 DEFAULT_TEMPLATES: dict[str, dict[str, str]] = {
-    "episode": {"pattern": "{series} - S{season:02}E{episode:02}", "output_mode": "filename"},
-    "special": {"pattern": "{series} - S{season:02}E{episode:02}", "output_mode": "filename"},
+    # v5：正片默认带上 {resolution}，同一集多版本时不会因为撞名直接失败；
+    # 分辨率识别不到时变量为空，会被折叠掉，不会留下多余的空括号。
+    # v6：正片默认带上 {version}，41v2 这类版本号不会在改名时丢掉；
+    # 识别不到版本时变量为空，整段 [v{version}] 会被折叠，不影响普通文件。
+    "episode": {
+        "pattern": "{series} - S{season:02}E{episode:02} [{resolution}] [v{version}]",
+        "output_mode": "filename",
+    },
+    # 内置特典模板：来源季在前（S01 CM01 / S02 NCOP01），用来区分同一作品不同季的同名特典。
+    # {source_season} 为空时整段自动折叠，不会留下双空格或孤立的「-」。
+    "special": {
+        "pattern": "{series} - {source_season} {special_type}{special_no}[v{version}]",
+        "output_mode": "filename",
+    },
     "movie": {"pattern": "{series} ({year})", "output_mode": "filename"},
 }
 
@@ -84,6 +134,27 @@ LEGACY_PATTERN_V3: dict[str, str] = {
     "[{group}] {series} - {episode:02} [{resolution}][{codec}]": "[{group}] {series} - S{season:02}E{episode:02} [{resolution}][{codec}]",
     "{series} - {special_type}{special_no:02}": "{series} - S{season:02}E{episode:02}",
     "[{group}] {series} - {special_type}{special_no:02} [{resolution}]": "[{group}] {series} - S{season:02}E{episode:02} [{resolution}]",
+}
+
+# 第 9 步：特典默认模板改为「作品名 - 特典类型+编号」，仍然放进特典季目录。
+# 只替换完全一致的内置写法（v4 之前的默认），用户自定义模板保持不变。
+LEGACY_SPECIAL_V4: dict[str, str] = {
+    "{series} - S{season:02}E{episode:02}": "{series} - {special_type}{special_no}",
+    "[{group}] {series} - S{season:02}E{episode:02} [{resolution}]": "[{group}] {series} - {special_type}{special_no} [{resolution}]",
+}
+
+# 第 10 步：内置正片模板加入 {resolution}，同一集多版本可以用清晰度区分。
+# 只替换与旧内置写法完全一致的模板；用户自己改过的模板不会被覆盖。
+LEGACY_EPISODE_V5: dict[str, str] = {
+    "{series} - S{season:02}E{episode:02}": "{series} - S{season:02}E{episode:02} [{resolution}]",
+}
+
+# 第 11 步 / v6：内置正片模板加入 {version}，41v2 这类版本号不再丢失。
+# 只替换与 v5 内置写法完全一致的模板；用户自己改过的模板不会被覆盖。
+LEGACY_EPISODE_V6: dict[str, str] = {
+    "{series} - S{season:02}E{episode:02} [{resolution}]": (
+        "{series} - S{season:02}E{episode:02} [{resolution}] [v{version}]"
+    ),
 }
 
 SEED_PRESETS: list[dict[str, Any]] = [
@@ -105,7 +176,7 @@ SEED_PRESETS: list[dict[str, Any]] = [
                 "output_mode": "filename",
             },
             "special": {
-                "pattern": "[{group}] {series} - S{season:02}E{episode:02} [{resolution}]",
+                "pattern": "[{group}] {series} - {source_season} {special_type}{special_no}[v{version}] [{resolution}]",
                 "output_mode": "filename",
             },
             "movie": {
@@ -121,11 +192,11 @@ SEED_PRESETS: list[dict[str, Any]] = [
         "library_profile": "jellyfin",
         "templates": {
             "episode": {
-                "pattern": "{series} - S{season:02}E{episode:02}",
+                "pattern": "{series} - S{season:02}E{episode:02} [{resolution}] [v{version}]",
                 "output_mode": "filename",
             },
             "special": {
-                "pattern": "{series} - S{season:02}E{episode:02}",
+                "pattern": "{series} - {source_season} {special_type}{special_no}[v{version}]",
                 "output_mode": "filename",
             },
             "movie": {
@@ -143,8 +214,17 @@ def _now() -> str:
 
 def _connect() -> sqlite3.Connection:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    # 配置目录常常位于 Windows 挂载盘上：默认的 rollback journal + FULL 同步
+    # 每次提交要两次 fsync（实测约 16ms）。WAL + NORMAL 把每次提交降到约 2ms，
+    # 执行阶段“每个文件都要落库”时才不会卡。失败时退回默认模式，保证还能用。
+    try:
+        conn.execute("PRAGMA busy_timeout = 15000")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
+    except sqlite3.DatabaseError:
+        pass
     return conn
 
 
@@ -253,6 +333,54 @@ def _legacy_rows(table: str) -> list[dict[str, Any]]:
         return [dict(row) for row in conn.execute(f"SELECT * FROM {table}").fetchall()]
 
 
+def _migrate_special_templates(presets: list[dict[str, Any]]) -> None:
+    """v4 一次性迁移：把旧内置特典模板换成「作品名 - 特典类型+编号」。
+
+    只在升级时执行一次，之后用户自己改成别的写法不会被反复覆盖。
+    """
+    for preset in presets:
+        templates = preset.get("templates")
+        if not isinstance(templates, dict):
+            continue
+        special = templates.get("special")
+        if isinstance(special, dict):
+            pattern = str(special.get("pattern") or "")
+            if pattern in LEGACY_SPECIAL_V4:
+                special["pattern"] = LEGACY_SPECIAL_V4[pattern]
+
+
+def _migrate_episode_resolution_v5(presets: list[dict[str, Any]]) -> None:
+    """v5 一次性迁移：给旧内置正片模板补上 {resolution}。
+
+    只替换和旧内置写法完全一致的模板，用户改过的写法保持原样。
+    """
+    for preset in presets:
+        templates = preset.get("templates")
+        if not isinstance(templates, dict):
+            continue
+        episode = templates.get("episode")
+        if isinstance(episode, dict):
+            pattern = str(episode.get("pattern") or "")
+            if pattern in LEGACY_EPISODE_V5:
+                episode["pattern"] = LEGACY_EPISODE_V5[pattern]
+
+
+def _migrate_episode_version_v6(presets: list[dict[str, Any]]) -> None:
+    """v6 一次性迁移：给旧内置正片模板补上 {version}。
+
+    只替换和 v5 内置写法完全一致的模板，用户改过的写法保持原样。
+    """
+    for preset in presets:
+        templates = preset.get("templates")
+        if not isinstance(templates, dict):
+            continue
+        episode = templates.get("episode")
+        if isinstance(episode, dict):
+            pattern = str(episode.get("pattern") or "")
+            if pattern in LEGACY_EPISODE_V6:
+                episode["pattern"] = LEGACY_EPISODE_V6[pattern]
+
+
 def _ensure_presets() -> dict[str, Any]:
     """确保 presets.json 存在；没有就从旧数据库或内置模板生成。"""
     with _LOCK:
@@ -269,6 +397,10 @@ def _ensure_presets() -> dict[str, Any]:
             normalized = {"version": PRESETS_VERSION, "default_id": default, "presets": presets}
             if doc.get("version") != PRESETS_VERSION:
                 # 旧版预设可能是“完整路径模板”，规范化时会拆成目录 + 文件名两部分
+                _migrate_special_templates(presets)
+                _migrate_episode_resolution_v5(presets)
+                _migrate_episode_version_v6(presets)
+                normalized = {"version": PRESETS_VERSION, "default_id": default, "presets": presets}
                 _write_json(PRESETS_FILE, normalized)
             return normalized
 
@@ -304,6 +436,9 @@ def _ensure_presets() -> dict[str, Any]:
                 for item in SEED_PRESETS
             ]
 
+        _migrate_special_templates(presets)
+        _migrate_episode_resolution_v5(presets)
+        _migrate_episode_version_v6(presets)
         if not any(item["is_default"] for item in presets):
             presets[0]["is_default"] = True
         doc = {
@@ -315,12 +450,39 @@ def _ensure_presets() -> dict[str, Any]:
         return doc
 
 
+def _append_missing_builtin_rules(rules: list[dict[str, Any]]) -> bool:
+    """把新版本新增的内置规则补进现有规则表；用户改过的旧规则保持原样。"""
+    existing = {str(item.get("id")) for item in rules}
+    added = False
+    for rule in BUILTIN_RULES:
+        if rule.id in existing:
+            continue
+        rules.append(
+            {
+                "id": rule.id,
+                "name": rule.name,
+                "scope": rule.scope,
+                "kind": rule.kind,
+                "priority": rule.priority,
+                "regex": rule.regex,
+                "enabled": bool(rule.enabled),
+                "description": rule.description,
+                "sample": rule.sample,
+            }
+        )
+        added = True
+    return added
+
+
 def _ensure_rules() -> list[dict[str, Any]]:
     """确保 rules.json 存在；没有就从旧数据库或内置规则生成。"""
     with _LOCK:
         doc = _read_json(RULES_FILE)
         if isinstance(doc, dict) and isinstance(doc.get("rules"), list) and doc["rules"]:
-            return [dict(item) for item in doc["rules"] if isinstance(item, dict)]
+            rules = [dict(item) for item in doc["rules"] if isinstance(item, dict)]
+            if _append_missing_builtin_rules(rules):
+                _write_json(RULES_FILE, {"version": 1, "rules": rules})
+            return rules
 
         legacy = _legacy_rows("rules")
         if legacy:
@@ -514,6 +676,406 @@ def delete_assignment(assignment_id: str) -> bool:
     return True
 
 
+def _normalize_special_memory(item: dict[str, Any]) -> dict[str, Any]:
+    """特典目录的归属记忆：按「目录组 + 目录相对路径」记住用户确认过的作品。"""
+    now = _now()
+    year = item.get("year")
+    try:
+        year_value = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        year_value = None
+    return {
+        "id": str(item.get("id") or f"sm-{uuid.uuid4().hex[:10]}"),
+        "group_id": str(item.get("group_id") or ""),
+        "rel_path": str(item.get("rel_path") or "").strip("/"),
+        "work_id": str(item.get("work_id") or ""),
+        "title": _repair_text(str(item.get("title") or ""))[:300],
+        "year": year_value,
+        "created_at": str(item.get("created_at") or now),
+        "updated_at": str(item.get("updated_at") or now),
+    }
+
+
+def _ensure_special_memory() -> dict[str, Any]:
+    with _LOCK:
+        doc = _read_json(SPECIAL_MEMORY_FILE)
+        if isinstance(doc, dict) and isinstance(doc.get("entries"), list):
+            entries = [
+                _normalize_special_memory(item)
+                for item in doc["entries"]
+                if isinstance(item, dict) and str(item.get("rel_path") or "").strip()
+            ]
+            normalized = {"version": SPECIAL_MEMORY_VERSION, "entries": entries}
+            if doc.get("version") != SPECIAL_MEMORY_VERSION:
+                _write_json(SPECIAL_MEMORY_FILE, normalized)
+            return normalized
+        doc = {"version": SPECIAL_MEMORY_VERSION, "entries": []}
+        _write_json(SPECIAL_MEMORY_FILE, doc)
+        return doc
+
+
+def list_special_memory() -> list[dict[str, Any]]:
+    return [dict(item) for item in _ensure_special_memory()["entries"]]
+
+
+def remember_special_folder(payload: dict[str, Any]) -> dict[str, Any]:
+    """记住特典目录的归属；同一目录组 + 同一目录已存在时直接更新。"""
+    with _LOCK:
+        doc = _ensure_special_memory()
+        entry = _normalize_special_memory(payload)
+        target = next(
+            (
+                item
+                for item in doc["entries"]
+                if item["group_id"] == entry["group_id"] and item["rel_path"] == entry["rel_path"]
+            ),
+            None,
+        )
+        if target is not None:
+            entry["id"] = target["id"]
+            entry["created_at"] = target.get("created_at") or entry["created_at"]
+            doc["entries"][doc["entries"].index(target)] = entry
+        else:
+            doc["entries"].append(entry)
+        _write_json(SPECIAL_MEMORY_FILE, doc)
+    return entry
+
+
+def delete_special_memory(memory_id: str) -> bool:
+    with _LOCK:
+        doc = _ensure_special_memory()
+        target = next((item for item in doc["entries"] if item["id"] == memory_id), None)
+        if target is None:
+            return False
+        doc["entries"].remove(target)
+        _write_json(SPECIAL_MEMORY_FILE, doc)
+    return True
+
+
+def _normalize_pattern_entry(item: dict[str, Any]) -> dict[str, Any]:
+    """命名规律缓存条目：指纹 + 目录组 + 子目录 + 结构 + 来源 + 命中次数。"""
+    now = _now()
+    structure = item.get("structure")
+    if not isinstance(structure, dict):
+        structure = {}
+    source = str(item.get("source") or "ai").strip().lower()
+    if source not in PATTERN_SOURCES:
+        source = "ai"
+    try:
+        hits = max(int(item.get("hits") or 0), 0)
+    except (TypeError, ValueError):
+        hits = 0
+    return {
+        "id": str(item.get("id") or f"pc-{uuid.uuid4().hex[:10]}"),
+        "fingerprint": str(item.get("fingerprint") or "").strip(),
+        "group_id": str(item.get("group_id") or ""),
+        "dir_rel": str(item.get("dir_rel") or "").strip("/").replace("\\", "/"),
+        "structure": structure,
+        "source": source,
+        "source_label": PATTERN_SOURCE_LABELS.get(source, "AI 生成"),
+        "enabled": bool(item.get("enabled", True)),
+        "hits": hits,
+        "created_at": str(item.get("created_at") or now),
+        "updated_at": str(item.get("updated_at") or now),
+        "last_used_at": str(item.get("last_used_at") or ""),
+    }
+
+
+def _ensure_pattern_cache() -> dict[str, Any]:
+    with _LOCK:
+        doc = _read_json(PATTERN_CACHE_FILE)
+        if isinstance(doc, dict) and isinstance(doc.get("entries"), list):
+            entries = [
+                _normalize_pattern_entry(item)
+                for item in doc["entries"]
+                if isinstance(item, dict) and str(item.get("fingerprint") or "").strip()
+            ]
+            normalized = {"version": PATTERN_CACHE_VERSION, "entries": entries}
+            if doc.get("version") != PATTERN_CACHE_VERSION:
+                _write_json(PATTERN_CACHE_FILE, normalized)
+            return normalized
+        doc = {"version": PATTERN_CACHE_VERSION, "entries": []}
+        _write_json(PATTERN_CACHE_FILE, doc)
+        return doc
+
+
+def list_pattern_entries() -> list[dict[str, Any]]:
+    return [dict(item) for item in _ensure_pattern_cache()["entries"]]
+
+
+def find_pattern_entry(fingerprint_code: str) -> dict[str, Any] | None:
+    code = str(fingerprint_code or "").strip()
+    if not code:
+        return None
+    target = next(
+        (item for item in _ensure_pattern_cache()["entries"] if item["fingerprint"] == code),
+        None,
+    )
+    return dict(target) if target is not None else None
+
+
+def save_pattern_entry(payload: dict[str, Any]) -> dict[str, Any]:
+    """按指纹新增或更新；同一指纹只保留一条，避免出现两份互相矛盾的规律。"""
+    with _LOCK:
+        doc = _ensure_pattern_cache()
+        entry = _normalize_pattern_entry(payload)
+        if not entry["fingerprint"]:
+            raise ValueError("缺少指纹，无法保存命名规律")
+        target = next(
+            (item for item in doc["entries"] if item["fingerprint"] == entry["fingerprint"]),
+            None,
+        )
+        if target is None:
+            doc["entries"].append(entry)
+        else:
+            entry["id"] = target["id"]
+            entry["created_at"] = target.get("created_at") or entry["created_at"]
+            entry["hits"] = int(target.get("hits") or 0)
+            entry["last_used_at"] = str(target.get("last_used_at") or "")
+            doc["entries"][doc["entries"].index(target)] = entry
+        _write_json(PATTERN_CACHE_FILE, doc)
+    return entry
+
+
+def mark_pattern_hit(fingerprint_code: str) -> dict[str, Any] | None:
+    """缓存命中自动套用后累加次数；只动命中统计，不改规律内容。"""
+    code = str(fingerprint_code or "").strip()
+    with _LOCK:
+        doc = _ensure_pattern_cache()
+        target = next((item for item in doc["entries"] if item["fingerprint"] == code), None)
+        if target is None:
+            return None
+        target["hits"] = int(target.get("hits") or 0) + 1
+        target["last_used_at"] = _now()
+        _write_json(PATTERN_CACHE_FILE, doc)
+        return dict(target)
+
+
+def set_pattern_enabled(entry_id: str, enabled: bool) -> dict[str, Any] | None:
+    with _LOCK:
+        doc = _ensure_pattern_cache()
+        target = next((item for item in doc["entries"] if item["id"] == entry_id), None)
+        if target is None:
+            return None
+        target["enabled"] = bool(enabled)
+        target["updated_at"] = _now()
+        _write_json(PATTERN_CACHE_FILE, doc)
+        return dict(target)
+
+
+def delete_pattern_entry(entry_id: str) -> bool:
+    with _LOCK:
+        doc = _ensure_pattern_cache()
+        target = next((item for item in doc["entries"] if item["id"] == entry_id), None)
+        if target is None:
+            return False
+        doc["entries"].remove(target)
+        _write_json(PATTERN_CACHE_FILE, doc)
+    return True
+
+
+def clear_pattern_cache() -> int:
+    with _LOCK:
+        doc = _ensure_pattern_cache()
+        count = len(doc["entries"])
+        doc["entries"] = []
+        _write_json(PATTERN_CACHE_FILE, doc)
+    return count
+
+
+def _normalize_pattern_decision(item: dict[str, Any]) -> dict[str, Any]:
+    now = _now()
+    decision = str(item.get("decision") or "later").strip().lower()
+    if decision not in PATTERN_DECISIONS:
+        decision = "later"
+    structure = item.get("structure")
+    return {
+        "id": str(item.get("id") or f"pd-{uuid.uuid4().hex[:10]}"),
+        "group_id": str(item.get("group_id") or ""),
+        "dir_rel": str(item.get("dir_rel") or "").strip("/").replace("\\", "/"),
+        "decision": decision,
+        "decision_label": PATTERN_DECISION_LABELS[decision],
+        "note": str(item.get("note") or ""),
+        "structure": structure if isinstance(structure, dict) else {},
+        "created_at": str(item.get("created_at") or now),
+        "updated_at": str(item.get("updated_at") or now),
+    }
+
+
+def _ensure_pattern_decisions() -> dict[str, Any]:
+    with _LOCK:
+        doc = _read_json(PATTERN_DECISIONS_FILE)
+        if isinstance(doc, dict) and isinstance(doc.get("entries"), list):
+            entries = [
+                _normalize_pattern_decision(item)
+                for item in doc["entries"]
+                if isinstance(item, dict) and str(item.get("group_id") or "")
+            ]
+            normalized = {"version": PATTERN_DECISIONS_VERSION, "entries": entries}
+            if doc.get("version") != PATTERN_DECISIONS_VERSION:
+                _write_json(PATTERN_DECISIONS_FILE, normalized)
+            return normalized
+        doc = {"version": PATTERN_DECISIONS_VERSION, "entries": []}
+        _write_json(PATTERN_DECISIONS_FILE, doc)
+        return doc
+
+
+def list_pattern_decisions() -> list[dict[str, Any]]:
+    return [dict(item) for item in _ensure_pattern_decisions()["entries"]]
+
+
+def get_pattern_decision(group_id: str, dir_rel: str) -> dict[str, Any] | None:
+    """取某个「目录组 + 子目录」最近一次的取舍记录。"""
+    group = str(group_id or "")
+    rel = str(dir_rel or "").strip("/").replace("\\", "/")
+    target = next(
+        (
+            item
+            for item in _ensure_pattern_decisions()["entries"]
+            if item["group_id"] == group and item["dir_rel"] == rel
+        ),
+        None,
+    )
+    return dict(target) if target is not None else None
+
+
+def save_pattern_decision(payload: dict[str, Any]) -> dict[str, Any]:
+    """记录采用 / 不采用 / 稍后再说；同一目录只保留最新一条。
+
+    只写取舍记录，不删除、不改动规律缓存本身。
+    """
+    with _LOCK:
+        doc = _ensure_pattern_decisions()
+        entry = _normalize_pattern_decision(payload)
+        if not entry["group_id"]:
+            raise ValueError("缺少目录组，无法记录取舍")
+        target = next(
+            (
+                item
+                for item in doc["entries"]
+                if item["group_id"] == entry["group_id"] and item["dir_rel"] == entry["dir_rel"]
+            ),
+            None,
+        )
+        if target is None:
+            doc["entries"].append(entry)
+        else:
+            entry["id"] = target["id"]
+            entry["created_at"] = target.get("created_at") or entry["created_at"]
+            doc["entries"][doc["entries"].index(target)] = entry
+        _write_json(PATTERN_DECISIONS_FILE, doc)
+    return entry
+
+
+def _normalize_alias(item: dict[str, Any]) -> dict[str, Any]:
+    """别名：同一部作品的另一种写法（日文名 / 罗马音 / 简称 / 繁简差异）。
+
+    只做精确匹配复用，不参与相似度合并，避免把两部作品自动合成一部。
+    """
+    now = _now()
+    year = item.get("year")
+    try:
+        year_value = int(year) if year not in (None, "") else None
+    except (TypeError, ValueError):
+        year_value = None
+    raw_id = item.get("tmdb_id")
+    try:
+        tmdb_id = int(raw_id) if raw_id not in (None, "") else None
+    except (TypeError, ValueError):
+        tmdb_id = None
+    media_type = str(item.get("media_type") or "").strip().lower()
+    if media_type not in ("tv", "movie"):
+        media_type = ""
+    return {
+        "id": str(item.get("id") or f"al-{uuid.uuid4().hex[:10]}"),
+        "title": _repair_text(str(item.get("title") or ""))[:300],
+        "year": year_value,
+        "alias": _repair_text(str(item.get("alias") or ""))[:300],
+        "tmdb_id": tmdb_id,
+        "media_type": media_type,
+        "created_at": str(item.get("created_at") or now),
+        "updated_at": str(item.get("updated_at") or now),
+    }
+
+
+def _ensure_aliases() -> dict[str, Any]:
+    with _LOCK:
+        doc = _read_json(ALIASES_FILE)
+        if isinstance(doc, dict) and isinstance(doc.get("aliases"), list):
+            aliases = [
+                _normalize_alias(item) for item in doc["aliases"] if isinstance(item, dict)
+            ]
+            normalized = {"version": ALIASES_VERSION, "aliases": aliases}
+            if doc.get("version") != ALIASES_VERSION:
+                _write_json(ALIASES_FILE, normalized)
+            return normalized
+
+        doc = {"version": ALIASES_VERSION, "aliases": []}
+        _write_json(ALIASES_FILE, doc)
+        return doc
+
+
+def list_aliases() -> list[dict[str, Any]]:
+    return [dict(item) for item in _ensure_aliases()["aliases"]]
+
+
+def create_alias(payload: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        doc = _ensure_aliases()
+        alias = _normalize_alias(payload)
+        doc["aliases"].append(alias)
+        _write_json(ALIASES_FILE, doc)
+    return alias
+
+
+def update_alias(alias_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    with _LOCK:
+        doc = _ensure_aliases()
+        target = next((item for item in doc["aliases"] if item["id"] == alias_id), None)
+        if target is None:
+            return None
+        updated = _normalize_alias(
+            {
+                "id": alias_id,
+                "title": payload.get("title", target.get("title")),
+                "year": payload.get("year", target.get("year")),
+                "alias": payload.get("alias", target.get("alias")),
+                "tmdb_id": payload.get("tmdb_id", target.get("tmdb_id")),
+                "media_type": payload.get("media_type", target.get("media_type")),
+                "created_at": target.get("created_at"),
+                "updated_at": _now(),
+            }
+        )
+        doc["aliases"][doc["aliases"].index(target)] = updated
+        _write_json(ALIASES_FILE, doc)
+    return updated
+
+
+def delete_alias(alias_id: str) -> bool:
+    with _LOCK:
+        doc = _ensure_aliases()
+        target = next((item for item in doc["aliases"] if item["id"] == alias_id), None)
+        if target is None:
+            return False
+        doc["aliases"].remove(target)
+        _write_json(ALIASES_FILE, doc)
+    return True
+
+
+def latest_operation_for_scan(scan_id: str) -> dict[str, Any] | None:
+    """轻量核对时取这个扫描最近一次执行记录，用来判断文件是不是已经移动到目标。"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM operations WHERE scan_id = ? AND kind = 'execute' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        items = _operation_items(conn, row["id"])
+    return _operation_from_row(row, items)
+
+
 def _migrate_keep_empty_dirs() -> None:
     """旧版本默认保留空目录，改为默认清理，避免源文件夹残留。"""
     with _connect() as conn:
@@ -544,6 +1106,18 @@ def _migrate_operation_items_v2() -> None:
         }
         if "group_id" not in columns:
             conn.execute("ALTER TABLE operation_items ADD COLUMN group_id TEXT")
+            conn.commit()
+
+
+def _migrate_operation_items_v5() -> None:
+    """第 6 步：冲突解决需要记住用户选的处理方式（跳过 / 覆盖 / 生成副本 / 合并…）。"""
+    with _connect() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(operation_items)").fetchall()
+        }
+        if "choice" not in columns:
+            conn.execute("ALTER TABLE operation_items ADD COLUMN choice TEXT NOT NULL DEFAULT ''")
             conn.commit()
 
 
@@ -594,6 +1168,7 @@ def init_db() -> None:
         conn.executescript(SCHEMA)
         conn.commit()
     _migrate_operation_items_v2()
+    _migrate_operation_items_v5()
     _migrate_operations_v4()
     # 旧版本可能把预设存在 SQLite 里，迁移前先确认有没有可用的预设来源
     had_presets = PRESETS_FILE.exists() or bool(_legacy_rows("presets"))
@@ -601,8 +1176,54 @@ def init_db() -> None:
     _ensure_rules()
     _ensure_groups()
     _ensure_assignments()
+    _ensure_aliases()
     _migrate_keep_empty_dirs()
     _migrate_settings_v2(had_presets)
+
+
+def create_session(token_hash: str, expires_at: str) -> None:
+    """登录成功后保存会话（只存 token 的哈希，不存原文）。"""
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            "insert or replace into auth_sessions (token_hash, created_at, expires_at) values (?, ?, ?)",
+            (token_hash, now, expires_at),
+        )
+        conn.commit()
+
+
+def session_is_valid(token_hash: str) -> bool:
+    if not token_hash:
+        return False
+    now = _now()
+    with _connect() as conn:
+        row = conn.execute(
+            "select expires_at from auth_sessions where token_hash = ?", (token_hash,)
+        ).fetchone()
+        if row is None:
+            return False
+        return str(row["expires_at"]) > now
+
+
+def delete_session(token_hash: str) -> None:
+    if not token_hash:
+        return
+    with _connect() as conn:
+        conn.execute("delete from auth_sessions where token_hash = ?", (token_hash,))
+        conn.commit()
+
+
+def delete_all_sessions() -> None:
+    with _connect() as conn:
+        conn.execute("delete from auth_sessions")
+        conn.commit()
+
+
+def cleanup_expired_sessions() -> None:
+    now = _now()
+    with _connect() as conn:
+        conn.execute("delete from auth_sessions where expires_at <= ?", (now,))
+        conn.commit()
 
 
 def list_presets() -> list[dict[str, Any]]:
@@ -743,23 +1364,140 @@ def import_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return created
 
 
+BUILTIN_RULE_IDS = {rule.id for rule in BUILTIN_RULES}
+
+
+def _rule_dict(item: dict[str, Any]) -> dict[str, Any]:
+    rule_id = str(item.get("id") or "")
+    return {
+        "id": rule_id,
+        "name": str(item.get("name") or ""),
+        "scope": str(item.get("scope") or "filename"),
+        "kind": str(item.get("kind") or "episode"),
+        "priority": int(item.get("priority") or 0),
+        "regex": str(item.get("regex") or ""),
+        "enabled": bool(item.get("enabled")),
+        "description": str(item.get("description") or ""),
+        "sample": str(item.get("sample") or ""),
+        # 内置规则不允许删除，只能启用 / 停用；用户自定义规则可以自由增删改。
+        "builtin": rule_id in BUILTIN_RULE_IDS,
+    }
+
+
+def list_rule_dicts() -> list[dict[str, Any]]:
+    rules = [_rule_dict(item) for item in _ensure_rules()]
+    rules.sort(key=lambda item: (item["scope"], item["priority"], item["id"]))
+    return rules
+
+
+def _validate_rule(rule_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    from .core.rules import validate_rule_payload
+
+    errors = validate_rule_payload(payload)
+    if errors:
+        raise ValueError("；".join(errors))
+    return {
+        "id": rule_id,
+        "name": str(payload.get("name") or "").strip()[:80] or rule_id,
+        "scope": str(payload.get("scope") or "filename"),
+        "kind": str(payload.get("kind") or "episode"),
+        "priority": int(payload.get("priority") or 0),
+        "regex": str(payload.get("regex") or "").strip(),
+        "enabled": bool(payload.get("enabled", True)),
+        "description": str(payload.get("description") or "")[:500],
+        "sample": str(payload.get("sample") or "")[:500],
+    }
+
+
+def _save_rules(rules: list[dict[str, Any]]) -> None:
+    _write_json(RULES_FILE, {"version": 1, "rules": rules})
+
+
+def create_rule(payload: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        rule_id = f"rule-{uuid.uuid4().hex[:10]}"
+        rule = _validate_rule(rule_id, payload)
+        rules = _ensure_rules()
+        rules.append(rule)
+        _save_rules(rules)
+    return _rule_dict(rule)
+
+
+def update_rule(rule_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    with _LOCK:
+        rules = _ensure_rules()
+        for index, item in enumerate(rules):
+            if str(item.get("id")) != rule_id:
+                continue
+            # 内置规则的 id 保持不变，只允许改启用状态、优先级等字段
+            merged = {**item, **payload}
+            if rule_id in BUILTIN_RULE_IDS:
+                merged["id"] = rule_id
+            rule = _validate_rule(rule_id, merged)
+            rules[index] = rule
+            _save_rules(rules)
+            return _rule_dict(rule)
+    return None
+
+
+def delete_rule(rule_id: str) -> bool:
+    if rule_id in BUILTIN_RULE_IDS:
+        raise ValueError("内置规则不能删除，可以停用它")
+    with _LOCK:
+        rules = _ensure_rules()
+        remaining = [item for item in rules if str(item.get("id")) != rule_id]
+        if len(remaining) == len(rules):
+            return False
+        _save_rules(remaining)
+    return True
+
+
+def reset_builtin_rules() -> list[dict[str, Any]]:
+    """恢复内置默认：重置内置规则，保留用户自定义规则。"""
+    with _LOCK:
+        rules = _ensure_rules()
+        custom = [item for item in rules if str(item.get("id")) not in BUILTIN_RULE_IDS]
+        builtin = [
+            {
+                "id": rule.id,
+                "name": rule.name,
+                "scope": rule.scope,
+                "kind": rule.kind,
+                "priority": rule.priority,
+                "regex": rule.regex,
+                "enabled": bool(rule.enabled),
+                "description": rule.description,
+                "sample": rule.sample,
+            }
+            for rule in BUILTIN_RULES
+        ]
+        _save_rules(builtin + custom)
+    return list_rule_dicts()
+
+
 def list_rules() -> list[Rule]:
     rules = _ensure_rules()
     ordered = sorted(rules, key=lambda item: (str(item.get("scope")), int(item.get("priority") or 0), str(item.get("id"))))
-    return [
-        Rule(
-            id=str(item.get("id")),
-            name=str(item.get("name") or ""),
-            scope=str(item.get("scope") or ""),
-            kind=str(item.get("kind") or ""),
-            priority=int(item.get("priority") or 0),
-            regex=str(item.get("regex") or ""),
-            enabled=bool(item.get("enabled")),
-            description=str(item.get("description") or ""),
-            sample=str(item.get("sample") or ""),
-        )
-        for item in ordered
-    ]
+    result: list[Rule] = []
+    for item in ordered:
+        try:
+            result.append(
+                Rule(
+                    id=str(item.get("id")),
+                    name=str(item.get("name") or ""),
+                    scope=str(item.get("scope") or ""),
+                    kind=str(item.get("kind") or ""),
+                    priority=int(item.get("priority") or 0),
+                    regex=str(item.get("regex") or ""),
+                    enabled=bool(item.get("enabled")),
+                    description=str(item.get("description") or ""),
+                    sample=str(item.get("sample") or ""),
+                )
+            )
+        except re.error:
+            # 手工改坏的正则直接跳过，避免整个扫描因此崩溃
+            continue
+    return result
 
 
 def _operation_from_row(row: sqlite3.Row, items: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -794,19 +1532,22 @@ def _operation_items(conn: sqlite3.Connection, operation_id: str) -> list[dict[s
         "SELECT * FROM operation_items WHERE operation_id = ? ORDER BY seq",
         (operation_id,),
     ).fetchall()
-    return [
-        {
-            "seq": row["seq"],
-            "group_id": row["group_id"],
-            "file_id": row["file_id"],
-            "category": row["category"],
-            "original_path": row["original_path"],
-            "target_path": row["target_path"],
-            "status": row["status"],
-            "message": row["message"],
-        }
-        for row in rows
-    ]
+    return [_item_dict(row) for row in rows]
+
+
+def _item_dict(row: sqlite3.Row) -> dict[str, Any]:
+    keys = row.keys()
+    return {
+        "seq": row["seq"],
+        "group_id": row["group_id"],
+        "file_id": row["file_id"],
+        "category": row["category"],
+        "original_path": row["original_path"],
+        "target_path": row["target_path"],
+        "status": row["status"],
+        "message": row["message"],
+        "choice": row["choice"] if "choice" in keys else "",
+    }
 
 
 def save_operation(
@@ -910,15 +1651,132 @@ def update_operation_item(
     status: str,
     target_path: str,
     message: str = "",
+    choice: str | None = None,
 ) -> None:
     """执行过程中逐行落库，保证中断后还能续跑。"""
     with _connect() as conn:
-        conn.execute(
+        if choice is None:
+            conn.execute(
+                "UPDATE operation_items SET status = ?, target_path = ?, message = ? "
+                "WHERE operation_id = ? AND seq = ?",
+                (status, target_path, message, operation_id, seq),
+            )
+        else:
+            conn.execute(
+                "UPDATE operation_items SET status = ?, target_path = ?, message = ?, choice = ? "
+                "WHERE operation_id = ? AND seq = ?",
+                (status, target_path, message, choice, operation_id, seq),
+            )
+        conn.commit()
+
+
+def open_connection() -> sqlite3.Connection:
+    """后台执行线程复用的长连接（每个文件都新建连接在挂载盘上很贵）。"""
+    return _connect()
+
+
+def update_operation_item_progress(
+    operation_id: str,
+    seq: int,
+    status: str,
+    target_path: str,
+    message: str,
+    processed: int,
+    current_item: str,
+    batch_index: int,
+    conn: sqlite3.Connection | None = None,
+) -> None:
+    """一条目执行完：条目状态和整体进度放在同一次提交里。
+
+    之前每个文件要提交三次（执行前进度、条目状态、执行后进度），
+    在 Windows 挂载盘上每次提交都会 fsync，等于每个文件多花两份冤枉时间。
+    传入 conn 时复用同一个连接（执行线程用一条连接跑完整批，省掉反复开关库的开销）。
+    """
+
+    def write(connection: sqlite3.Connection) -> None:
+        connection.execute(
             "UPDATE operation_items SET status = ?, target_path = ?, message = ? "
             "WHERE operation_id = ? AND seq = ?",
             (status, target_path, message, operation_id, seq),
         )
+        connection.execute(
+            "UPDATE operations SET processed_items = ?, current_item = ?, batch_index = ? WHERE id = ?",
+            (processed, current_item, batch_index, operation_id),
+        )
+        connection.commit()
+
+    if conn is not None:
+        write(conn)
+        return
+    with _connect() as own:
+        write(own)
+
+
+def insert_operation_items(operation_id: str, items: list[dict[str, Any]]) -> list[int]:
+    """冲突解决时把文件夹合并展开成逐文件条目，接在已有编号后面。"""
+    if not items:
+        return []
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT MAX(seq) AS last FROM operation_items WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        next_seq = int((row["last"] if row and row["last"] is not None else 0) + 1)
+        seqs: list[int] = []
+        for item in items:
+            conn.execute(
+                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message, choice) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    operation_id,
+                    next_seq,
+                    item.get("group_id"),
+                    item.get("file_id"),
+                    item.get("category"),
+                    item.get("original_path", ""),
+                    item.get("target_path", ""),
+                    item.get("status", "planned"),
+                    item.get("message", ""),
+                    item.get("choice", ""),
+                ),
+            )
+            seqs.append(next_seq)
+            next_seq += 1
+        conn.execute(
+            "UPDATE operations SET total_items = total_items + ? WHERE id = ?",
+            (len(items), operation_id),
+        )
         conn.commit()
+    return seqs
+
+
+def update_operation_summary(operation_id: str, patch: dict[str, Any]) -> dict[str, Any]:
+    """在保留原有摘要的前提下追加信息（例如冲突解决的统计）。"""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT summary FROM operations WHERE id = ?", (operation_id,)
+        ).fetchone()
+        try:
+            summary = json.loads((row["summary"] if row else "") or "{}")
+        except (TypeError, ValueError):
+            summary = {}
+        summary.update(patch)
+        conn.execute(
+            "UPDATE operations SET summary = ? WHERE id = ?",
+            (json.dumps(summary, ensure_ascii=False), operation_id),
+        )
+        conn.commit()
+    return summary
+
+
+def operation_conflict_items(operation_id: str) -> list[dict[str, Any]]:
+    """取还没处理的冲突条目（第一轮执行结束后统一展示）。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM operation_items WHERE operation_id = ? AND status = 'conflict' ORDER BY seq",
+            (operation_id,),
+        ).fetchall()
+    return [_item_dict(row) for row in rows]
 
 
 def finalize_operation(operation_id: str, status: str, summary: dict[str, Any] | None = None) -> None:
@@ -944,7 +1802,7 @@ def get_operation(operation_id: str) -> dict[str, Any] | None:
     return _operation_from_row(row, items)
 
 
-FINAL_ITEM_STATUS = ("done", "skipped", "failed", "conflict")
+FINAL_ITEM_STATUS = ("done", "skipped", "failed", "conflict", "merged")
 
 
 def operation_item_counts(operation_id: str) -> dict[str, int]:
@@ -954,7 +1812,7 @@ def operation_item_counts(operation_id: str) -> dict[str, int]:
             "SELECT status, COUNT(*) AS total FROM operation_items WHERE operation_id = ? GROUP BY status",
             (operation_id,),
         ).fetchall()
-    counts = {"done": 0, "skipped": 0, "failed": 0, "conflict": 0, "planned": 0}
+    counts = {"done": 0, "skipped": 0, "failed": 0, "conflict": 0, "planned": 0, "merged": 0}
     for row in rows:
         counts[str(row["status"])] = int(row["total"])
     counts["total"] = sum(counts.values())
@@ -980,6 +1838,7 @@ def get_operation_progress(operation_id: str) -> dict[str, Any] | None:
         "failed": counts["failed"],
         "conflict": counts["conflict"],
         "planned": counts["planned"],
+        "merged": counts["merged"],
         "current_item": row["current_item"],
         "batch_index": row["batch_index"],
         "batch_count": row["batch_count"],
@@ -1046,6 +1905,7 @@ def pending_operation_items(operation_id: str) -> list[dict[str, Any]]:
             "target_path": row["target_path"],
             "status": row["status"],
             "message": row["message"],
+            "choice": row["choice"] if "choice" in row.keys() else "",
         }
         for row in rows
     ]
@@ -1088,6 +1948,7 @@ def operation_done_items(operation_id: str) -> list[dict[str, Any]]:
         {
             "seq": row["seq"],
             "group_id": row["group_id"],
+            "category": row["category"],
             "original_path": row["original_path"],
             "target_path": row["target_path"],
         }
@@ -1121,3 +1982,87 @@ def mark_operation_status(operation_id: str, status: str) -> None:
             (status, _now() if status == "undone" else None, operation_id),
         )
         conn.commit()
+
+
+# ---------------------------------------------------------------- 扫描结果持久化
+
+
+def _scan_for_storage(payload: dict[str, Any]) -> dict[str, Any]:
+    """只存必要内容：去掉每个文件的临时核对结果，其余字段扫描恢复时都要用到。"""
+    data = dict(payload)
+    data.pop("restored", None)
+    data.pop("restored_at", None)
+    files: list[dict[str, Any]] = []
+    for row in data.get("files") or []:
+        if not isinstance(row, dict):
+            continue
+        item = dict(row)
+        item.pop("check", None)
+        files.append(item)
+    data["files"] = files
+    return data
+
+
+def _cleanup_scan_records() -> None:
+    """清理旧扫描：超过保留次数或超过有效期的记录直接删掉。"""
+    from datetime import timedelta
+
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM scans WHERE scan_id IN ("
+            "  SELECT scan_id FROM scans ORDER BY created_at DESC LIMIT -1 OFFSET ?"
+            ")",
+            (SCAN_KEEP_LATEST,),
+        )
+        expired = (datetime.now(timezone.utc) - timedelta(days=SCAN_TTL_DAYS)).isoformat()
+        conn.execute("DELETE FROM scans WHERE created_at < ?", (expired,))
+        conn.commit()
+
+
+def save_scan_record(payload: dict[str, Any]) -> None:
+    """把扫描会话写入 SQLite；容器重启后可以接着用。"""
+    scan_id = str(payload.get("scan_id") or "")
+    if not scan_id:
+        return
+    data = _scan_for_storage(payload)
+    now = _now()
+    created_at = str(payload.get("created_at") or now)
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO scans (scan_id, created_at, updated_at, file_count, data) "
+            "VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(scan_id) DO UPDATE SET "
+            "data = excluded.data, updated_at = excluded.updated_at, file_count = excluded.file_count",
+            (scan_id, created_at, now, len(data.get("files") or []), json.dumps(data, ensure_ascii=False)),
+        )
+        conn.commit()
+    _cleanup_scan_records()
+
+
+def load_scan_record(scan_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT data FROM scans WHERE scan_id = ?", (scan_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        data = json.loads(row["data"])
+    except (TypeError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def delete_scan_record(scan_id: str) -> bool:
+    with _connect() as conn:
+        cursor = conn.execute("DELETE FROM scans WHERE scan_id = ?", (scan_id,))
+        conn.commit()
+        return bool(cursor.rowcount)
+
+
+def list_scan_records(limit: int = 20) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT scan_id, created_at, updated_at, file_count FROM scans "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]

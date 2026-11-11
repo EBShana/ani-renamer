@@ -9,7 +9,13 @@ from ..config import config_schema, get_media_root, load_settings, save_settings
 from ..core.fields import field_payload
 from ..core.metadata import test_connectivity
 from ..scanner_helpers import is_under
-from ..store import list_rules
+from ..store import (
+    create_rule,
+    delete_rule,
+    list_rule_dicts,
+    reset_builtin_rules,
+    update_rule,
+)
 
 router = APIRouter()
 
@@ -40,7 +46,11 @@ class ConfigPayload(BaseModel):
 
 @router.put("/config")
 def write_config(payload: ConfigPayload) -> dict:
-    return {"values": save_settings(payload.values)}
+    try:
+        values = save_settings(payload.values)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"values": values}
 
 
 class ProviderTestPayload(BaseModel):
@@ -65,9 +75,58 @@ def test_provider(payload: ProviderTestPayload | None = None) -> dict:
     return test_connectivity(proxy, key)
 
 
+class RulePayload(BaseModel):
+    name: str
+    scope: str = "filename"
+    kind: str = "episode"
+    priority: int = 0
+    regex: str
+    enabled: bool = True
+    description: str = ""
+    sample: str = ""
+
+
 @router.get("/rules")
 def read_rules() -> dict:
-    return {"rules": [rule.to_dict() for rule in list_rules()]}
+    return {
+        "rules": list_rule_dicts(),
+        "note": "修改规则只对下一次扫描生效，已经生成的扫描结果不会自动更新。",
+    }
+
+
+@router.post("/rules")
+def create_rule_endpoint(payload: RulePayload) -> dict:
+    try:
+        return {"rule": create_rule(payload.model_dump())}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.put("/rules/{rule_id}")
+def update_rule_endpoint(rule_id: str, payload: RulePayload) -> dict:
+    try:
+        rule = update_rule(rule_id, payload.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if rule is None:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    return {"rule": rule}
+
+
+@router.delete("/rules/{rule_id}")
+def delete_rule_endpoint(rule_id: str) -> dict:
+    try:
+        removed = delete_rule(rule_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not removed:
+        raise HTTPException(status_code=404, detail="规则不存在")
+    return {"ok": True}
+
+
+@router.post("/rules/reset")
+def reset_rules_endpoint() -> dict:
+    return {"rules": reset_builtin_rules()}
 
 
 @router.get("/browse")

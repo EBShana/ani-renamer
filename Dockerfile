@@ -32,6 +32,7 @@ ENV PIP_INDEX_URL=${PIP_INDEX_URL}
 RUN pip install --timeout 60 --retries 5 -r requirements.txt
 
 COPY backend/app ./app
+COPY backend/tools ./tools
 COPY --from=frontend /out ./app/static
 COPY backend/entrypoint.sh /entrypoint.sh
 

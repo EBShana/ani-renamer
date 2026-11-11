@@ -356,3 +356,110 @@ def fetch_movie(movie_id: int, api_key: str, language: str) -> dict:
         "seasons": [],
         "episodes": {},
     }
+
+
+# 作品名语言回退顺序：简体 → 繁体 → 日文原名 → 英文（可在设置页调整）
+NAME_ORDERS: dict[str, tuple[str, ...]] = {
+    "cn_tw_jp_en": ("zh-CN", "zh-TW", "original", "en-US"),
+    "cn_jp_tw_en": ("zh-CN", "original", "zh-TW", "en-US"),
+    "cn_tw_en_jp": ("zh-CN", "zh-TW", "en-US", "original"),
+}
+
+NAME_SOURCE_LABELS = {
+    "zh-CN": "简体中文",
+    "zh-TW": "繁体中文",
+    "original": "日文原名",
+    "en-US": "英文",
+}
+
+
+def name_language_order(settings: dict | None = None) -> tuple[str, ...]:
+    """读设置里的语言顺序；没配或配错就用默认的简-繁-日-英。"""
+    values = settings or load_settings()
+    key = str(values.get("metadata.name_language_order") or "cn_tw_jp_en")
+    return NAME_ORDERS.get(key, NAME_ORDERS["cn_tw_jp_en"])
+
+
+def name_source_label(code: str) -> str:
+    return NAME_SOURCE_LABELS.get(str(code or ""), "")
+
+
+def _fetch_detail(media_type: str, tmdb_id: int, api_key: str, language: str) -> dict:
+    """只取主信息（不发季请求），用于换语言再查一次名字。"""
+    if not api_key:
+        raise MetadataError("请先在设置页填写 TMDB API Key")
+    path = "movie" if media_type == "movie" else "tv"
+    params = {"language": language, **_tmdb_params(api_key)}
+    return _get_json(f"{TMDB_BASE}/{path}/{tmdb_id}", params, _tmdb_auth(api_key))
+
+
+def resolve_display_name(
+    meta: dict,
+    api_key: str,
+    order: tuple[str, ...] | None = None,
+    base_language: str = "zh-CN",
+) -> dict:
+    """按语言顺序确定作品名，并注明来源。
+
+    判定「没有简体翻译」的标准：简体名称为空，或与原名完全相同。
+    名字一律来自 TMDB 返回值，AI 不参与生成。
+    base_language 是抓详情时用的语言：不是简体时会额外查一次简体。
+    """
+    sequence = order or NAME_ORDERS["cn_tw_jp_en"]
+    name = str(meta.get("name") or "").strip()
+    original = str(meta.get("original_name") or "").strip()
+    media_type = str(meta.get("media_type") or "tv")
+    base = str(base_language or "zh-CN").lower()
+    try:
+        tmdb_id = int(meta.get("tmdb_id") or 0)
+    except (TypeError, ValueError):
+        tmdb_id = 0
+
+    for code in sequence:
+        if code == "zh-CN":
+            if base.startswith("zh-cn"):
+                # 已经用简体抓过详情，直接看结果
+                if name and name != original:
+                    return {**meta, "name": name, "name_source": "zh-CN"}
+                continue
+            if not tmdb_id:
+                continue
+            try:
+                detail = _fetch_detail(media_type, tmdb_id, api_key, "zh-CN")
+            except MetadataError:
+                continue
+            candidate = str(detail.get("name") or detail.get("title") or "").strip()
+            if not candidate or candidate == original:
+                continue
+            return {
+                **meta,
+                "name": candidate,
+                "name_source": "zh-CN",
+                "overview": _short(detail.get("overview")) or meta.get("overview"),
+            }
+        if code == "original":
+            if original:
+                return {**meta, "name": original, "name_source": "original"}
+            continue
+        if not tmdb_id:
+            continue
+        try:
+            detail = _fetch_detail(media_type, tmdb_id, api_key, code)
+        except MetadataError:
+            continue
+        candidate = str(detail.get("name") or detail.get("title") or "").strip()
+        # TMDB 在没有该语言翻译时常回退成原名，这种不算“有该语言名称”
+        if not candidate or candidate == original:
+            continue
+        return {
+            **meta,
+            "name": candidate,
+            "name_source": code,
+            "overview": _short(detail.get("overview")) or meta.get("overview"),
+        }
+
+    if name and name != original:
+        return {**meta, "name": name, "name_source": "zh-CN" if base.startswith("zh-cn") else base}
+    if original:
+        return {**meta, "name": original, "name_source": "original"}
+    return {**meta, "name": "", "name_source": ""}

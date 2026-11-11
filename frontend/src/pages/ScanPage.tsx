@@ -5,6 +5,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Divider,
   Empty,
   Input,
@@ -26,12 +27,24 @@ import {
   FolderOpenOutlined,
   PlayCircleOutlined,
   PlusOutlined,
-  SearchOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { api } from "../api";
-import type { Category, DirectoryGroup, ParsedFile, Preset, ScanPayload } from "../types";
+import type {
+  AiIdentifySuggestion,
+  AiStatus,
+  Category,
+  DirectoryGroup,
+  ParsedFile,
+  Preset,
+  QueueEntry,
+  QueueView,
+  RescanCheck,
+  ScanPayload,
+  ScanRecord,
+} from "../types";
 import { CATEGORY_LABELS } from "../types";
+import ListFilterBar, { EMPTY_FILTER, entryMatches, type ListFilterValue } from "../listFilters";
 
 const { Text, Title } = Typography;
 
@@ -55,8 +68,10 @@ const CATEGORY_COLORS: Record<Category, string> = {
 
 interface Props {
   scan: ScanPayload | null;
+  queue: QueueView | null;
   onScan: (payload: ScanPayload | null) => void;
   onNext: () => void;
+  reloadQueue: () => Promise<void>;
   presets: Preset[];
   presetId: string | null;
   onPresetChange: (presetId: string) => void;
@@ -74,14 +89,28 @@ function formatSize(bytes: number): string {
   return `${value.toFixed(1)} ${units[index]}`;
 }
 
-export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPresetChange }: Props) {
+export default function ScanPage({
+  scan,
+  queue,
+  onScan,
+  onNext,
+  reloadQueue,
+  presets,
+  presetId,
+  onPresetChange,
+}: Props) {
   const [groups, setGroups] = useState<DirectoryGroup[]>([]);
+  const [checked, setChecked] = useState<string[]>([]);
+  const [moving, setMoving] = useState(false);
   const [mediaRoot, setMediaRoot] = useState("");
   const [selected, setSelected] = useState<string[]>([]);
   const [groupErrors, setGroupErrors] = useState<string[]>([]);
   const [loadError, setLoadError] = useState("");
   const [scanning, setScanning] = useState(false);
-  const [keyword, setKeyword] = useState("");
+  const [filters, setFilters] = useState<ListFilterValue>(EMPTY_FILTER);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<ScanRecord[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [browseOpen, setBrowseOpen] = useState(false);
   const [browseTarget, setBrowseTarget] = useState<"source" | "target" | null>(null);
   const [browse, setBrowse] = useState<{
@@ -94,6 +123,17 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
   const [editing, setEditing] = useState<DirectoryGroup | null>(null);
   const [form, setForm] = useState({ name: "", source: "", target: "" });
   const [groupsLocked, setGroupsLocked] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [fullRescanning, setFullRescanning] = useState(false);
+  const [lastCheck, setLastCheck] = useState<RescanCheck | null>(null);
+  const [aiStatus, setAiStatus] = useState<AiStatus | null>(null);
+  const [aiOpen, setAiOpen] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiApplying, setAiApplying] = useState(false);
+  const [aiSuggestions, setAiSuggestions] = useState<AiIdentifySuggestion[]>([]);
+  const [aiChecked, setAiChecked] = useState<string[]>([]);
+  const [aiRemember, setAiRemember] = useState(true);
+  const [aiNote, setAiNote] = useState("");
 
   const loadGroups = async (keepSelection = true) => {
     try {
@@ -116,6 +156,7 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
 
   useEffect(() => {
     void loadGroups(false);
+    api.aiStatus().then(setAiStatus).catch(() => setAiStatus(null));
   }, []);
 
   const openBrowse = async (path?: string, target: "source" | "target" = "source") => {
@@ -145,6 +186,151 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
       message.error(`扫描失败：${(error as Error).message}`);
     } finally {
       setScanning(false);
+    }
+  };
+
+  useEffect(() => {
+    setLastCheck(scan?.last_check ?? null);
+  }, [scan?.scan_id, scan?.last_check?.checked_at]);
+
+  useEffect(() => {
+    setChecked(scan?.selections?.scan ?? []);
+  }, [scan?.scan_id]);
+
+  const runRecheck = async () => {
+    if (!scan) return;
+    setChecking(true);
+    try {
+      const result = await api.recheck(scan.scan_id);
+      setLastCheck(result.check);
+      const fresh = await api.getScan(scan.scan_id);
+      onScan(fresh);
+      await reloadQueue();
+      message.success(
+        `核对完成：还在 ${result.check.ok} 个，已移动 ${result.check.moved} 个，缺失 ${result.check.missing} 个`,
+      );
+    } catch (error) {
+      message.error(`核对失败：${(error as Error).message}`);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const runFullRescan = async () => {
+    if (!scan) return;
+    setFullRescanning(true);
+    try {
+      const groupIds = (scan.groups ?? []).map((item) => item.id);
+      const result = await api.rescan(scan.scan_id, groupIds);
+      setLastCheck(null);
+      setChecked([]);
+      onScan(result);
+      await reloadQueue();
+      message.success(`完整重扫完成：${result.stats.total} 个文件，清单已回到扫描页`);
+    } catch (error) {
+      message.error(`完整重扫失败：${(error as Error).message}`);
+    } finally {
+      setFullRescanning(false);
+    }
+  };
+
+  const openHistory = async () => {
+    setHistoryOpen(true);
+    setHistoryLoading(true);
+    try {
+      const result = await api.scans();
+      setHistory(result.scans);
+    } catch (error) {
+      message.error(`读取历史扫描失败：${(error as Error).message}`);
+    } finally {
+      setHistoryLoading(false);
+    }
+  };
+
+  const restoreHistory = async (record: ScanRecord) => {
+    try {
+      const payload = await api.getScan(record.scan_id);
+      setChecked([]);
+      setFilters(EMPTY_FILTER);
+      onScan(payload);
+      await reloadQueue();
+      setHistoryOpen(false);
+      message.success(
+        payload.restored
+          ? "已恢复上次的扫描结果，可能已经过时，建议先点「核对当前清单」"
+          : "已恢复扫描结果",
+      );
+    } catch (error) {
+      message.error(`恢复失败：${(error as Error).message}`);
+    }
+  };
+
+  const removeHistory = async (record: ScanRecord) => {
+    try {
+      await api.deleteScan(record.scan_id);
+      setHistory((prev) => prev.filter((item) => item.scan_id !== record.scan_id));
+      message.success("已删除这条扫描记录");
+    } catch (error) {
+      message.error(`删除失败：${(error as Error).message}`);
+    }
+  };
+
+  const runAiIdentify = async () => {
+    if (!scan) return;
+    setAiLoading(true);
+    try {
+      const result = await api.aiIdentifySuggest({
+        scan_id: scan.scan_id,
+        limit: aiStatus?.batch_limit,
+      });
+      setAiSuggestions(result.suggestions);
+      setAiChecked(result.suggestions.map((item) => item.file_id));
+      setAiNote(result.message);
+      setAiOpen(true);
+      if (!result.suggestions.length) {
+        message.info(result.message || "AI 没有给出建议");
+      }
+    } catch (error) {
+      message.error(`AI 辅助识别失败：${(error as Error).message}`);
+    } finally {
+      setAiLoading(false);
+    }
+  };
+
+  const applyAiIdentify = async () => {
+    if (!scan) return;
+    const picked = aiSuggestions.filter((item) => aiChecked.includes(item.file_id));
+    if (!picked.length) {
+      message.warning("请先勾选要确认的建议");
+      return;
+    }
+    setAiApplying(true);
+    try {
+      const result = await api.aiIdentifyApply({
+        scan_id: scan.scan_id,
+        remember_alias: aiRemember,
+        items: picked.map((item) => ({
+          file_ids: [item.file_id],
+          title: item.title,
+          year: item.year,
+          season: item.season,
+          episode: item.episode,
+          kind: item.kind,
+          segment: item.segment,
+          remember_alias: aiRemember,
+        })),
+      });
+      message.success(
+        `已确认 ${result.applied} 个文件${result.remembered ? `，记住了 ${result.remembered} 个写法` : ""}`,
+      );
+      setAiOpen(false);
+      const fresh = await api.getScan(scan.scan_id);
+      onScan(fresh);
+      await reloadQueue();
+    } catch (error) {
+      message.error(`确认 AI 建议失败：${(error as Error).message}`);
+    } finally {
+      setAiApplying(false);
     }
   };
 
@@ -187,45 +373,118 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
     }
   };
 
-  const rows = useMemo(() => {
-    if (!scan) return [];
-    const text = keyword.trim().toLowerCase();
-    if (!text) return scan.files;
-    return scan.files.filter(
-      (file) =>
-        file.filename.toLowerCase().includes(text) ||
-        (file.title ?? "").toLowerCase().includes(text) ||
-        file.group.toLowerCase().includes(text),
-    );
-  }, [scan, keyword]);
+  const fileMap = useMemo(
+    () => new Map((scan?.files ?? []).map((file) => [file.id, file])),
+    [scan],
+  );
 
-  const groupNameOf = (groupId?: string) => {
-    const fromScan = scan?.groups?.find((item) => item.id === groupId);
-    const fromList = groups.find((item) => item.id === groupId);
-    return fromScan?.name || fromList?.name || "";
+  const unassignedCount = useMemo(
+    () =>
+      (scan?.files ?? []).filter(
+        (file) =>
+          file.category === "video" && !file.identify?.work_id && !file.identify?.ignored,
+      ).length,
+    [scan],
+  );
+
+  const scanEntries = useMemo(() => {
+    const entries = (queue?.entries ?? []).filter((entry) => entry.stage === "scan");
+    return entries.filter((entry) =>
+      entryMatches(entry, filters, {
+        file: fileMap.get(entry.file_ids[0] ?? ""),
+        selected: checked.includes(entry.entry_id),
+      }),
+    );
+  }, [queue, filters, checked, fileMap]);
+
+  const filteredChecked = scanEntries.filter((entry) => checked.includes(entry.entry_id)).length;
+  const groupOptions = useMemo(
+    () =>
+      groups
+        .map((group) => ({ value: group.id, label: group.name }))
+        .concat(
+          scanEntries
+            .map((entry) => entry.group_id || "")
+            .filter((id, index, list) => id && groups.every((group) => group.id !== id) && list.indexOf(id) === index)
+            .map((id) => ({ value: id, label: id })),
+        ),
+    [groups, scanEntries],
+  );
+
+  const byGroup = useMemo(() => {
+    const result: Record<string, QueueEntry[]> = {};
+    for (const entry of scanEntries) {
+      const key = entry.group_id || "";
+      (result[key] ||= []).push(entry);
+    }
+    return result;
+  }, [scanEntries]);
+
+  const persistSelection = (ids: string[]) => {
+    if (scan) void api.saveSelection(scan.scan_id, "scan", ids).catch(() => undefined);
   };
 
-  const columns: ColumnsType<ParsedFile> = [
+  const toggleEntry = (entryId: string, on: boolean) => {
+    const next = on ? [...checked, entryId] : checked.filter((id) => id !== entryId);
+    setChecked(next);
+    persistSelection(next);
+  };
+
+  const toggleMany = (entryIds: string[], on: boolean) => {
+    const rest = checked.filter((id) => !entryIds.includes(id));
+    const next = on ? [...rest, ...entryIds] : rest;
+    setChecked(next);
+    persistSelection(next);
+  };
+
+  const moveNext = async () => {
+    if (!scan || !checked.length) {
+      message.warning("请先勾选要带出的条目");
+      return;
+    }
+    setMoving(true);
+    try {
+      const count = checked.length;
+      await api.queueMove(scan.scan_id, checked, "match");
+      setChecked([]);
+      persistSelection([]);
+      await reloadQueue();
+      message.success(`已带出 ${count} 个条目到「匹配作品」`);
+      onNext();
+    } catch (error) {
+      message.error(`带出失败：${(error as Error).message}`);
+    } finally {
+      setMoving(false);
+    }
+  };
+
+  const entryColumns: ColumnsType<QueueEntry> = [
     {
-      title: "文件",
-      dataIndex: "filename",
-      width: 360,
+      title: "",
+      width: 40,
       render: (_, record) => (
-        <Tooltip title={record.path}>
-          <div className="preview-name">{record.filename}</div>
-          <div className="path-text">{record.parent}</div>
-        </Tooltip>
+        <Checkbox
+          checked={checked.includes(record.entry_id)}
+          onChange={(event) => toggleEntry(record.entry_id, event.target.checked)}
+        />
+      ),
+    },
+    {
+      title: "条目",
+      render: (_, record) => (
+        <div>
+          <div className="preview-name">
+            {record.is_folder ? "[素材文件夹] " : ""}
+            {record.filename}
+          </div>
+          <div className="path-text">{record.rel_path}</div>
+        </div>
       ),
     },
     {
       title: "类别",
       dataIndex: "category",
       width: 84,
-      filters: (Object.keys(CATEGORY_LABELS) as Category[]).map((key) => ({
-        text: CATEGORY_LABELS[key],
-        value: key,
-      })),
-      onFilter: (value, record) => record.category === value,
       render: (value: Category) => (
         <Tag color={CATEGORY_COLORS[value]}>{CATEGORY_LABELS[value] ?? value}</Tag>
       ),
@@ -233,53 +492,47 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
     {
       title: "类型",
       dataIndex: "kind",
-      width: 88,
-      filters: [
-        { text: "剧集", value: "episode" },
-        { text: "特典", value: "special" },
-        { text: "剧场版", value: "movie" },
-        { text: "未识别", value: "unknown" },
-      ],
-      onFilter: (value, record) => record.kind === value,
+      width: 86,
       render: (value: string) => {
+        if (!value || value === "asset") return <Text type="secondary">-</Text>;
         const meta = KIND_META[value] ?? KIND_META.unknown;
-        return value === "asset" ? <Text type="secondary">-</Text> : <Tag color={meta.color}>{meta.label}</Tag>;
+        return <Tag color={meta.color}>{meta.label}</Tag>;
       },
     },
     {
       title: "作品",
-      dataIndex: "title",
-      width: 180,
-      render: (value: string | null) => value || <Text type="danger">未提取</Text>,
+      render: (_, record) =>
+        record.needs_assign ? (
+          <Tag color="red">未归属，需在匹配页指派</Tag>
+        ) : (
+          record.title || <Text type="danger">未提取</Text>
+        ),
     },
     {
       title: "季 / 集",
-      width: 110,
+      width: 100,
       render: (_, record) =>
         record.kind === "special"
-          ? `${record.special_type ?? "SP"}${record.special_no ?? ""}`
+          ? "特典"
           : record.season != null && record.episode != null
             ? `S${String(record.season).padStart(2, "0")}E${String(record.episode).padStart(2, "0")}`
             : "-",
     },
-    { title: "发布组", dataIndex: "group", width: 150, render: (value: string) => value || "-" },
-    { title: "分辨率", dataIndex: "resolution", width: 92, render: (value: string) => value || "-" },
-    { title: "编码", dataIndex: "codec", width: 82, render: (value: string) => value || "-" },
-    { title: "大小", dataIndex: "size", width: 90, render: (value: number) => formatSize(value) },
     {
-      title: "状态",
-      dataIndex: "status",
-      width: 96,
-      render: (value: string, record) =>
-        value === "ok" ? (
-          <Tag color="green">已识别</Tag>
-        ) : (
-          <Tooltip title={record.warnings.join("；")}>
-            <Tag color="orange">待确认</Tag>
-          </Tooltip>
-        ),
+      title: "字幕",
+      width: 84,
+      render: (_, record) =>
+        record.category === "video" && record.file_ids.length > 1
+          ? `${record.file_ids.length - 1} 个（跟随）`
+          : "-",
     },
   ];
+
+  const groupNameOf = (groupId?: string) => {
+    const fromScan = scan?.groups?.find((item) => item.id === groupId);
+    const fromList = groups.find((item) => item.id === groupId);
+    return fromScan?.name || fromList?.name || "";
+  };
 
   return (
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
@@ -422,11 +675,28 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
               清空扫描结果
             </Button>
           )}
+          <Button onClick={openHistory} style={{ marginTop: 12 }}>
+            历史扫描
+          </Button>
         </div>
       </Card>
 
       {scan && (
         <Card>
+          {scan.restored && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message="这是上次保存的扫描结果，可能已经过时"
+              description="容器重启后从数据库恢复。文件可能已经移动或新增，建议先点「核对当前清单」；需要发现新文件时用「完整重扫」。"
+              action={
+                <Button size="small" loading={checking} onClick={runRecheck}>
+                  核对当前清单
+                </Button>
+              }
+            />
+          )}
           <Row gutter={16} className="stat-row" style={{ marginBottom: 8 }}>
             <Col span={6}>
               <Text type="secondary">文件总数</Text>
@@ -467,12 +737,54 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
               </div>
             </Col>
           </Row>
+          <Divider />
+          <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Space wrap>
+              <Button loading={checking} onClick={runRecheck}>
+                核对当前清单（轻量）
+              </Button>
+              <Button loading={fullRescanning} onClick={runFullRescan}>
+                完整重扫
+              </Button>
+              <Tooltip
+                title={
+                  !aiStatus
+                    ? "AI 状态加载中"
+                    : !aiStatus.configured
+                      ? aiStatus.message
+                      : unassignedCount === 0
+                        ? "没有需要 AI 判断的未归属文件"
+                        : "把未归属文件按目录打包一次发给 AI，只返回建议"
+                }
+              >
+                <Button
+                  loading={aiLoading}
+                  disabled={!aiStatus?.configured || unassignedCount === 0}
+                  onClick={runAiIdentify}
+                >
+                  AI 辅助识别{unassignedCount > 0 ? `（未归属 ${unassignedCount}）` : ""}
+                </Button>
+              </Tooltip>
+              {lastCheck && (
+                <Text type="secondary">
+                  上次核对：还在 {lastCheck.ok} 个 · 已移动 {lastCheck.moved} 个 · 缺失{" "}
+                  {lastCheck.missing} 个 · 清单完成 {lastCheck.entries_done} 项
+                </Text>
+              )}
+            </Space>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              执行成功完成后默认不会自动重扫；失败、文件夹合并 / 覆盖、取消后会自动核对一次。
+              「核对当前清单」只检查文件还在不在；文件缺失或需要发现新文件时用「完整重扫」，
+              完整重扫会把清单重新回到扫描页。AI 辅助只给建议，确认后才生效，
+              只发送文件名和目录名，不发送文件内容。
+            </Text>
+          </Space>
           {(scan.ignored_dirs?.length ?? 0) > 0 && (
             <Alert
               type="info"
               showIcon
               style={{ marginTop: 12, marginBottom: 12 }}
-              message={`已跳过 ${scan.ignored_dirs?.length} 个目录（${scan.markers_written ?? 0} 个空标记文件已写入）`}
+              message={`已跳过 ${scan.ignored_dirs?.length} 个目录（空标记文件改为移动完成后再写入）`}
               description={
                 <Space direction="vertical" size={2}>
                   {scan.ignored_dirs?.map((dir, index) => (
@@ -491,47 +803,103 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
             />
           )}
           {scan.truncated && (
-            <Alert type="warning" showIcon message="文件数量达到上限（20000），仅处理了前 20000 个文件。" style={{ marginBottom: 12 }} />
-          )}
-          <Space style={{ marginBottom: 12, justifyContent: "space-between", width: "100%" }}>
-            <Input
-              prefix={<SearchOutlined />}
-              placeholder="按文件名 / 作品 / 发布组过滤"
-              style={{ width: 320 }}
-              value={keyword}
-              onChange={(event) => setKeyword(event.target.value)}
-              allowClear
+            <Alert
+              type="warning"
+              showIcon
+              message={`已达到上限（${scan.max_files ?? 20000} 个文件），还有文件未扫描，请缩小目录范围后重新扫描。`}
+              style={{ marginBottom: 12 }}
             />
-            <Button type="primary" onClick={onNext}>
-              下一步：匹配作品
-            </Button>
-          </Space>
-          <Table
-            rowKey="id"
-            size="small"
-            columns={columns}
-            dataSource={rows}
-            pagination={{ pageSize: 12, showSizeChanger: true, showTotal: (total) => `共 ${total} 条` }}
-            scroll={{ x: 1200 }}
-            expandable={{
-              expandedRowRender: (record) => (
-                <div className="mono" style={{ whiteSpace: "pre-wrap" }}>
-                  {record.warnings.length > 0 && (
-                    <Text type="warning">提示：{record.warnings.join("；")}</Text>
-                  )}
-                  <div style={{ marginTop: 4 }}>解析字段：</div>
-                  {Object.entries(record.fields)
-                    .filter(([, value]) => value !== "" && value !== 0)
-                    .map(([key, value]) => (
-                      <span key={key} style={{ marginRight: 16 }}>
-                        {key}={String(value)}
-                      </span>
-                    ))}
-                </div>
-              ),
-            }}
-            locale={{ emptyText: <Empty description="没有匹配的文件" /> }}
+          )}
+          <ListFilterBar
+            value={filters}
+            onChange={setFilters}
+            groupOptions={groupOptions}
+            selectedCount={filteredChecked}
+            totalCount={scanEntries.length}
+            extra={
+              <Space>
+                <Text type="secondary">
+                  总已选 {checked.length} / 留在本页 {Math.max(0, (queue?.counts.scan ?? 0) - checked.length)}
+                </Text>
+                <Button type="primary" loading={moving} onClick={moveNext}>
+                  下一步：带出 {checked.length} 项 → 匹配作品
+                </Button>
+              </Space>
+            }
           />
+          {scanEntries.length === 0 ? (
+            <Empty
+              description={
+                (queue?.entries ?? []).some((entry) => entry.stage === "scan")
+                  ? "没有符合筛选条件的条目，可以清空搜索和筛选再看看"
+                  : "本页没有待带出的条目了，可以回到「匹配作品」页继续"
+              }
+            />
+          ) : (
+            <Collapse
+              key={Object.keys(byGroup).join("|")}
+              defaultActiveKey={Object.keys(byGroup)}
+              items={Object.entries(byGroup).map(([groupId, entries]) => {
+                const ids = entries.map((entry) => entry.entry_id);
+                const picked = ids.filter((id) => checked.includes(id)).length;
+                return {
+                  key: groupId || "none",
+                  label: (
+                    <Space>
+                      <Text strong>{groupNameOf(groupId) || "未分组"}</Text>
+                      <Tag>{entries.length} 项</Tag>
+                      {picked > 0 && <Tag color="blue">已选 {picked}</Tag>}
+                    </Space>
+                  ),
+                  children: (
+                    <>
+                      <Checkbox
+                        checked={picked === ids.length}
+                        indeterminate={picked > 0 && picked < ids.length}
+                        onChange={(event) => toggleMany(ids, event.target.checked)}
+                        style={{ marginBottom: 8 }}
+                      >
+                        全选本组（{ids.length} 项）
+                      </Checkbox>
+                      <Table
+                        rowKey="entry_id"
+                        size="small"
+                        columns={entryColumns}
+                        dataSource={entries}
+                        pagination={{ pageSize: 10, showSizeChanger: true, showTotal: (total) => `共 ${total} 条` }}
+                        scroll={{ x: 900 }}
+                        expandable={{
+                          expandedRowRender: (record) => {
+                            const file = fileMap.get(record.file_ids[0] ?? "");
+                            if (!file) return <Text type="secondary">素材文件夹作为一个整体移动，内部文件不单独列。</Text>;
+                            return (
+                              <div className="mono" style={{ whiteSpace: "pre-wrap" }}>
+                                {file.warnings.length > 0 && (
+                                  <Text type="warning">提示：{file.warnings.join("；")}</Text>
+                                )}
+                                <div style={{ marginTop: 4 }}>
+                                  路径：{file.path}
+                                </div>
+                                <div style={{ marginTop: 4 }}>解析字段：</div>
+                                {Object.entries(file.fields)
+                                  .filter(([, value]) => value !== "" && value !== 0)
+                                  .map(([key, value]) => (
+                                    <span key={key} style={{ marginRight: 16 }}>
+                                      {key}={String(value)}
+                                    </span>
+                                  ))}
+                              </div>
+                            );
+                          },
+                        }}
+                        locale={{ emptyText: <Empty description="没有匹配的条目" /> }}
+                      />
+                    </>
+                  ),
+                };
+              })}
+            />
+          )}
         </Card>
       )}
 
@@ -642,6 +1010,131 @@ export default function ScanPage({ scan, onScan, onNext, presets, presetId, onPr
             />
           </>
         )}
+      </Modal>
+
+      <Modal
+        title="AI 辅助识别（建议）"
+        open={aiOpen}
+        width={760}
+        onCancel={() => setAiOpen(false)}
+        footer={
+          <Space>
+            <Checkbox checked={aiRemember} onChange={(event) => setAiRemember(event.target.checked)}>
+              记住这些写法（别名），下次自动复用
+            </Checkbox>
+            <Button onClick={() => setAiOpen(false)}>取消</Button>
+            <Button type="primary" loading={aiApplying} onClick={applyAiIdentify}>
+              确认勾选的建议
+            </Button>
+          </Space>
+        }
+      >
+        <Space direction="vertical" size={8} style={{ width: "100%" }}>
+          <Alert
+            type="warning"
+            showIcon
+            message="AI 只给建议，确认后才会写入；未确认的不会保存。只发送文件名和目录名，不发送文件内容。"
+          />
+          {aiNote && <Text type="secondary">{aiNote}</Text>}
+          {aiSuggestions.length === 0 ? (
+            <Empty description="AI 没有给出建议" />
+          ) : (
+            <div style={{ maxHeight: 440, overflowY: "auto" }}>
+              {aiSuggestions.map((item) => (
+                <div
+                  key={item.file_id}
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    padding: "8px 0",
+                    borderBottom: "1px solid #f0f0f0",
+                  }}
+                >
+                  <Checkbox
+                    checked={aiChecked.includes(item.file_id)}
+                    onChange={(event) =>
+                      setAiChecked((prev) =>
+                        event.target.checked
+                          ? [...prev, item.file_id]
+                          : prev.filter((id) => id !== item.file_id),
+                      )
+                    }
+                  />
+                  <div style={{ flex: 1 }}>
+                    <div className="preview-name">{item.filename}</div>
+                    <Space wrap size={4} style={{ marginTop: 4 }}>
+                      <Tag color="purple">来自 AI</Tag>
+                      <Text strong>{item.title}</Text>
+                      {item.year != null && <Text type="secondary">({item.year})</Text>}
+                      {item.kind === "special" && <Tag>特典</Tag>}
+                      {item.kind === "movie" && <Tag>剧场版</Tag>}
+                      {item.kind !== "movie" && item.season != null && item.episode != null && (
+                        <Tag>
+                          {`S${String(item.season).padStart(2, "0")}E${String(item.episode).padStart(2, "0")}`}
+                        </Tag>
+                      )}
+                      {Object.entries(item.tags || {}).map(([key, value]) => (
+                        <Tag key={key}>
+                          {key}: {String(value)}
+                        </Tag>
+                      ))}
+                    </Space>
+                    {item.reason && (
+                      <div>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          判断依据：{item.reason}
+                        </Text>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </Space>
+      </Modal>
+
+      <Modal
+        title="历史扫描（最近 10 次，超过 14 天自动清理）"
+        open={historyOpen}
+        onCancel={() => setHistoryOpen(false)}
+        footer={null}
+        width={620}
+      >
+        <Alert
+          type="info"
+          showIcon
+          message="扫描结果保存在数据库里，容器重启后还能恢复；删除后不可找回。"
+          style={{ marginBottom: 12 }}
+        />
+        <List
+          loading={historyLoading}
+          dataSource={history}
+          locale={{ emptyText: "还没有保存的扫描记录" }}
+          renderItem={(record) => (
+            <List.Item
+              actions={[
+                <Button key="restore" size="small" onClick={() => restoreHistory(record)}>
+                  恢复
+                </Button>,
+                <Popconfirm
+                  key="delete"
+                  title="删除这条扫描记录？"
+                  onConfirm={() => removeHistory(record)}
+                >
+                  <Button size="small" danger>
+                    删除
+                  </Button>
+                </Popconfirm>,
+              ]}
+            >
+              <List.Item.Meta
+                title={`${record.file_count} 个文件`}
+                description={`扫描于 ${new Date(record.created_at).toLocaleString()}`}
+              />
+            </List.Item>
+          )}
+        />
       </Modal>
     </Space>
   );

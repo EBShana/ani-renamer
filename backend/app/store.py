@@ -16,17 +16,24 @@ from .config import (
     CONFIG_DIR,
     CONFIG_FILE,
     DB_PATH,
-    default_preset_options,
+    GLOBAL_ONLY_KEYS,
+    LEGACY_PRESET_OPTION_KEYS,
+    WORKFLOW_PRESET_OPTION_KEYS,
+    default_naming_options,
+    default_workflow_options,
     get_media_root,
     load_settings,
+    naming_options_from_settings,
     save_settings,
     setting_values_from_preset_options,
-    settings_to_preset_options,
+    workflow_options_from_settings,
 )
 from .core.groups import normalize_group, validate_groups
 from .core.rules import BUILTIN_RULES, Rule
+from .core.run_advance import RUN_STAGE_ORDER
 
-PRESETS_VERSION = 6
+# v7：预设拆成两层——命名预设（模板 + 命名/落点选项）与工作流预设（其余选项）。
+PRESETS_VERSION = 7
 GROUPS_VERSION = 1
 ASSIGNMENTS_VERSION = 1
 ALIASES_VERSION = 1
@@ -81,6 +88,83 @@ CREATE TABLE IF NOT EXISTS auth_sessions (
     created_at TEXT NOT NULL,
     expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runs (
+    id TEXT PRIMARY KEY,
+    scan_id TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT 'scan',
+    status TEXT NOT NULL DEFAULT 'active',
+    preset_id TEXT,
+    operation_id TEXT,
+    groups TEXT NOT NULL DEFAULT '[]',
+    snapshot TEXT NOT NULL DEFAULT '{}',
+    lock_owner TEXT NOT NULL DEFAULT '',
+    lock_expires_at TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runs_scan ON runs(scan_id);
+CREATE TABLE IF NOT EXISTS pending_items (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL,
+    ref_type TEXT NOT NULL DEFAULT '',
+    ref_id TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    reason TEXT NOT NULL DEFAULT '',
+    blocking INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'open',
+    resolved_by TEXT NOT NULL DEFAULT '',
+    resolved_at TEXT NOT NULL DEFAULT '',
+    decision_source TEXT NOT NULL DEFAULT '',
+    meta TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(run_id, kind, ref_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pending_run ON pending_items(run_id, status);
+CREATE TABLE IF NOT EXISTS decisions (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL DEFAULT '',
+    scan_id TEXT NOT NULL DEFAULT '',
+    operation_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    ref_id TEXT NOT NULL DEFAULT '',
+    choice TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'human',
+    rule_id TEXT NOT NULL DEFAULT '',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_scan ON decisions(scan_id);
+CREATE TABLE IF NOT EXISTS auto_authorizations (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL DEFAULT '',
+    operation_id TEXT NOT NULL DEFAULT '',
+    confirmed_by TEXT NOT NULL,
+    risk_version TEXT NOT NULL,
+    risk_text TEXT NOT NULL DEFAULT '',
+    gate_checked_at TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'granted',
+    created_at TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_auto_auth_run ON auto_authorizations(run_id, status);
+CREATE TABLE IF NOT EXISTS run_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    scan_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT '',
+    stage TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
+    detail TEXT NOT NULL DEFAULT '{}',
+    source TEXT NOT NULL DEFAULT 'human',
+    rule_id TEXT NOT NULL DEFAULT '',
+    actor TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_run_events_run ON run_events(run_id, id);
 """
 
 PRESETS_FILE = CONFIG_DIR / "presets.json"
@@ -255,8 +339,9 @@ def _repair_text(value: str) -> str:
         return value
 
 
-def _normalize_options(options: dict[str, Any] | None) -> dict[str, Any]:
-    result = default_preset_options()
+def _normalize_option_map(
+    options: dict[str, Any] | None, result: dict[str, Any]
+) -> dict[str, Any]:
     if isinstance(options, dict):
         for key, default in result.items():
             if key not in options:
@@ -272,6 +357,14 @@ def _normalize_options(options: dict[str, Any] | None) -> dict[str, Any]:
             else:
                 result[key] = _repair_text(str(value)[:2000])
     return result
+
+
+def _normalize_naming_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    return _normalize_option_map(options, default_naming_options())
+
+
+def _normalize_workflow_options(options: dict[str, Any] | None) -> dict[str, Any]:
+    return _normalize_option_map(options, default_workflow_options())
 
 
 def _split_legacy_structure(pattern: str) -> tuple[str, str]:
@@ -308,15 +401,33 @@ def _normalize_templates(templates: dict[str, Any] | None) -> dict[str, dict[str
     return result
 
 
-def _normalize_preset(item: dict[str, Any], fallback_id: str | None = None) -> dict[str, Any]:
+def _normalize_naming_preset(
+    item: dict[str, Any], fallback_id: str | None = None
+) -> dict[str, Any]:
     now = _now()
     return {
-        "id": str(item.get("id") or fallback_id or f"preset-{uuid.uuid4().hex[:10]}"),
-        "name": _repair_text(str(item.get("name") or "未命名预设"))[:120],
+        "id": str(item.get("id") or fallback_id or f"naming-{uuid.uuid4().hex[:10]}"),
+        "name": _repair_text(str(item.get("name") or "未命名命名预设"))[:120],
         "is_default": bool(item.get("is_default")),
         "library_profile": str(item.get("library_profile") or "generic")[:40],
         "templates": _normalize_templates(item.get("templates")),
-        "options": _normalize_options(item.get("options")),
+        "options": _normalize_naming_options(item.get("options")),
+        "created_at": str(item.get("created_at") or now),
+        "updated_at": str(item.get("updated_at") or now),
+    }
+
+
+def _normalize_workflow_preset(
+    item: dict[str, Any], fallback_id: str | None = None
+) -> dict[str, Any]:
+    now = _now()
+    return {
+        "id": str(item.get("id") or fallback_id or f"workflow-{uuid.uuid4().hex[:10]}"),
+        "name": _repair_text(str(item.get("name") or "未命名工作流预设"))[:120],
+        "is_default": bool(item.get("is_default")),
+        "library_profile": str(item.get("library_profile") or "generic")[:40],
+        "naming_preset_id": str(item.get("naming_preset_id") or ""),
+        "options": _normalize_workflow_options(item.get("options")),
         "created_at": str(item.get("created_at") or now),
         "updated_at": str(item.get("updated_at") or now),
     }
@@ -381,33 +492,200 @@ def _migrate_episode_version_v6(presets: list[dict[str, Any]]) -> None:
                 episode["pattern"] = LEGACY_EPISODE_V6[pattern]
 
 
+def _seed_naming_presets() -> list[dict[str, Any]]:
+    return [
+        _normalize_naming_preset({**item, "options": default_naming_options()})
+        for item in SEED_PRESETS
+    ]
+
+
+def _seed_workflow_presets() -> list[dict[str, Any]]:
+    """三条内置预设各配一份同名工作流预设，并指向同名的命名预设。"""
+    return [
+        _normalize_workflow_preset(
+            {
+                "id": item["id"],
+                "name": item["name"],
+                "is_default": item["is_default"],
+                "library_profile": item["library_profile"],
+                "naming_preset_id": item["id"],
+                "options": default_workflow_options(),
+            }
+        )
+        for item in SEED_PRESETS
+    ]
+
+
+def _legacy_global_option_key(option: str) -> str:
+    return {
+        "tmdb_lang": "providers.tmdb_lang",
+        "name_language_order": "metadata.name_language_order",
+    }.get(option, "")
+
+
+def _split_legacy_presets(
+    presets: list[dict[str, Any]], global_settings: dict[str, Any]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """v7 一次性迁移：把“模板 + 全部选项”的单层预设拆成两层。
+
+    只搬运能确认来源的值：旧快照里有的键按原值搬过去；旧快照里没有的键
+    取默认值并写进迁移记录；无法归类或已改为全局的键也逐条记录，不靠猜。
+    """
+    record: dict[str, Any] = {
+        "from_version": 6,
+        "to_version": PRESETS_VERSION,
+        "migrated_at": _now(),
+        "filled_defaults": [],
+        "dropped_keys": [],
+        "global_only_ignored": [],
+    }
+    naming_presets: list[dict[str, Any]] = []
+    workflow_presets: list[dict[str, Any]] = []
+    for item in presets:
+        preset_id = str(item.get("id") or f"preset-{uuid.uuid4().hex[:10]}")
+        name = item.get("name")
+        options = item.get("options") if isinstance(item.get("options"), dict) else {}
+        naming_options: dict[str, Any] = {}
+        workflow_options: dict[str, Any] = {}
+        for key in default_naming_options():
+            if key in options:
+                naming_options[key] = options[key]
+            else:
+                record["filled_defaults"].append(
+                    {"preset_id": preset_id, "layer": "naming", "key": key}
+                )
+        for key in default_workflow_options():
+            if key in options:
+                workflow_options[key] = options[key]
+            else:
+                record["filled_defaults"].append(
+                    {"preset_id": preset_id, "layer": "workflow", "key": key}
+                )
+        for key, value in options.items():
+            if key in naming_options or key in workflow_options:
+                continue
+            global_key = _legacy_global_option_key(key)
+            if global_key in GLOBAL_ONLY_KEYS:
+                if value != global_settings.get(global_key):
+                    record["global_only_ignored"].append(
+                        {
+                            "preset_id": preset_id,
+                            "key": global_key,
+                            "preset_value": value,
+                            "global_value": global_settings.get(global_key),
+                        }
+                    )
+                continue
+            record["dropped_keys"].append({"preset_id": preset_id, "key": key})
+        naming_presets.append(
+            _normalize_naming_preset(
+                {
+                    "id": preset_id,
+                    "name": name,
+                    "is_default": item.get("is_default"),
+                    "library_profile": item.get("library_profile"),
+                    "templates": item.get("templates"),
+                    "options": naming_options,
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        )
+        workflow_presets.append(
+            _normalize_workflow_preset(
+                {
+                    "id": preset_id,
+                    "name": name,
+                    "is_default": item.get("is_default"),
+                    "library_profile": item.get("library_profile"),
+                    "naming_preset_id": preset_id,
+                    "options": workflow_options,
+                    "created_at": item.get("created_at"),
+                    "updated_at": item.get("updated_at"),
+                }
+            )
+        )
+    return naming_presets, workflow_presets, record
+
+
+def _fix_preset_defaults_and_links(
+    naming: list[dict[str, Any]], workflow: list[dict[str, Any]]
+) -> bool:
+    """保证两层都各有一个默认预设，并把断掉的工作流→命名引用指回默认命名预设。"""
+    changed = False
+    if naming and not any(item["is_default"] for item in naming):
+        naming[0]["is_default"] = True
+        changed = True
+    naming_ids = {item["id"] for item in naming}
+    default_naming = next(
+        (item["id"] for item in naming if item["is_default"]), naming[0]["id"] if naming else ""
+    )
+    for item in workflow:
+        if not item.get("naming_preset_id") or item["naming_preset_id"] not in naming_ids:
+            item["naming_preset_id"] = default_naming
+            changed = True
+    if workflow and not any(item["is_default"] for item in workflow):
+        workflow[0]["is_default"] = True
+        changed = True
+    return changed
+
+
+def _presets_doc(
+    naming: list[dict[str, Any]],
+    workflow: list[dict[str, Any]],
+    migration: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    default_workflow = next(
+        (item["id"] for item in workflow if item["is_default"]),
+        workflow[0]["id"] if workflow else "",
+    )
+    default_naming = next(
+        (item["id"] for item in naming if item["is_default"]),
+        naming[0]["id"] if naming else "",
+    )
+    doc: dict[str, Any] = {
+        "version": PRESETS_VERSION,
+        "default_id": default_workflow,
+        "default_naming_id": default_naming,
+        "naming_presets": naming,
+        "workflow_presets": workflow,
+    }
+    if migration is not None:
+        doc["migration"] = migration
+    return doc
+
+
 def _ensure_presets() -> dict[str, Any]:
-    """确保 presets.json 存在；没有就从旧数据库或内置模板生成。"""
+    """确保 presets.json 存在；旧版单层预设会一次性拆成命名预设 + 工作流预设。"""
     with _LOCK:
         doc = _read_json(PRESETS_FILE)
-        if isinstance(doc, dict) and isinstance(doc.get("presets"), list) and doc["presets"]:
-            presets = [
-                _normalize_preset(item, item.get("id"))
-                for item in doc["presets"]
+        if isinstance(doc, dict) and isinstance(doc.get("naming_presets"), list):
+            naming = [
+                _normalize_naming_preset(item, item.get("id"))
+                for item in doc["naming_presets"]
                 if isinstance(item, dict)
             ]
-            if not any(item["is_default"] for item in presets):
-                presets[0]["is_default"] = True
-            default = next((item["id"] for item in presets if item["is_default"]), presets[0]["id"])
-            normalized = {"version": PRESETS_VERSION, "default_id": default, "presets": presets}
-            if doc.get("version") != PRESETS_VERSION:
-                # 旧版预设可能是“完整路径模板”，规范化时会拆成目录 + 文件名两部分
-                _migrate_special_templates(presets)
-                _migrate_episode_resolution_v5(presets)
-                _migrate_episode_version_v6(presets)
-                normalized = {"version": PRESETS_VERSION, "default_id": default, "presets": presets}
+            workflow = [
+                _normalize_workflow_preset(item, item.get("id"))
+                for item in doc.get("workflow_presets") or []
+                if isinstance(item, dict)
+            ]
+            if not naming:
+                naming = _seed_naming_presets()
+            if not workflow:
+                workflow = _seed_workflow_presets()
+            changed = _fix_preset_defaults_and_links(naming, workflow)
+            migration = doc.get("migration") if isinstance(doc.get("migration"), dict) else None
+            normalized = _presets_doc(naming, workflow, migration)
+            if doc.get("version") != PRESETS_VERSION or changed:
                 _write_json(PRESETS_FILE, normalized)
             return normalized
 
-        legacy = _legacy_rows("presets")
-        if legacy:
-            presets = []
-            for row in legacy:
+        legacy: list[dict[str, Any]] = []
+        if isinstance(doc, dict) and isinstance(doc.get("presets"), list) and doc["presets"]:
+            legacy = [item for item in doc["presets"] if isinstance(item, dict)]
+        else:
+            for row in _legacy_rows("presets"):
                 try:
                     templates = json.loads(row.get("templates") or "{}")
                 except (TypeError, ValueError):
@@ -416,38 +694,38 @@ def _ensure_presets() -> dict[str, Any]:
                     options = json.loads(row.get("options") or "{}")
                 except (TypeError, ValueError):
                     options = {}
-                presets.append(
-                    _normalize_preset(
-                        {
-                            "id": row.get("id"),
-                            "name": row.get("name"),
-                            "is_default": bool(row.get("is_default")),
-                            "library_profile": row.get("library_profile"),
-                            "templates": templates,
-                            "options": options,
-                            "created_at": row.get("created_at"),
-                            "updated_at": row.get("updated_at"),
-                        }
-                    )
+                legacy.append(
+                    {
+                        "id": row.get("id"),
+                        "name": row.get("name"),
+                        "is_default": bool(row.get("is_default")),
+                        "library_profile": row.get("library_profile"),
+                        "templates": templates,
+                        "options": options,
+                        "created_at": row.get("created_at"),
+                        "updated_at": row.get("updated_at"),
+                    }
                 )
+        if legacy:
+            _migrate_special_templates(legacy)
+            _migrate_episode_resolution_v5(legacy)
+            _migrate_episode_version_v6(legacy)
+            naming, workflow, record = _split_legacy_presets(legacy, load_settings())
         else:
-            presets = [
-                _normalize_preset({**item, "options": default_preset_options()})
-                for item in SEED_PRESETS
-            ]
-
-        _migrate_special_templates(presets)
-        _migrate_episode_resolution_v5(presets)
-        _migrate_episode_version_v6(presets)
-        if not any(item["is_default"] for item in presets):
-            presets[0]["is_default"] = True
-        doc = {
-            "version": PRESETS_VERSION,
-            "default_id": next(item["id"] for item in presets if item["is_default"]),
-            "presets": presets,
-        }
-        _write_json(PRESETS_FILE, doc)
-        return doc
+            naming = _seed_naming_presets()
+            workflow = _seed_workflow_presets()
+            record = {
+                "from_version": 0,
+                "to_version": PRESETS_VERSION,
+                "migrated_at": _now(),
+                "filled_defaults": [],
+                "dropped_keys": [],
+                "global_only_ignored": [],
+            }
+        _fix_preset_defaults_and_links(naming, workflow)
+        normalized = _presets_doc(naming, workflow, record)
+        _write_json(PRESETS_FILE, normalized)
+        return normalized
 
 
 def _append_missing_builtin_rules(rules: list[dict[str, Any]]) -> bool:
@@ -1091,7 +1369,7 @@ def _migrate_keep_empty_dirs() -> None:
         conn.commit()
 
     doc = _ensure_presets()
-    for preset in doc["presets"]:
+    for preset in doc["workflow_presets"]:
         preset["options"]["keep_empty_dirs"] = False
     with _LOCK:
         _write_json(PRESETS_FILE, doc)
@@ -1119,6 +1397,24 @@ def _migrate_operation_items_v5() -> None:
         if "choice" not in columns:
             conn.execute("ALTER TABLE operation_items ADD COLUMN choice TEXT NOT NULL DEFAULT ''")
             conn.commit()
+
+
+def _migrate_operation_items_v7() -> None:
+    """记录每个需要人拍板的条目是谁定的：人工 / 规则 / 未来 AI，以及决策时间。"""
+    additions = {
+        "decision_source": "TEXT NOT NULL DEFAULT ''",
+        "rule_id": "TEXT NOT NULL DEFAULT ''",
+        "decided_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    with _connect() as conn:
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(operation_items)").fetchall()
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                conn.execute(f"ALTER TABLE operation_items ADD COLUMN {name} {ddl}")
+        conn.commit()
 
 
 def _migrate_operations_v4() -> None:
@@ -1158,8 +1454,16 @@ def _migrate_settings_v2(had_presets: bool) -> None:
     values = load_settings()
     if had_presets:
         doc = _ensure_presets()
-        preset = next((item for item in doc["presets"] if item["is_default"]), doc["presets"][0])
-        values.update(setting_values_from_preset_options(preset.get("options") or {}))
+        naming = next(
+            (item for item in doc["naming_presets"] if item["is_default"]),
+            doc["naming_presets"][0],
+        )
+        workflow = next(
+            (item for item in doc["workflow_presets"] if item["is_default"]),
+            doc["workflow_presets"][0],
+        )
+        merged = {**naming.get("options", {}), **workflow.get("options", {})}
+        values.update(setting_values_from_preset_options(merged))
     save_settings(values)
 
 
@@ -1169,6 +1473,7 @@ def init_db() -> None:
         conn.commit()
     _migrate_operation_items_v2()
     _migrate_operation_items_v5()
+    _migrate_operation_items_v7()
     _migrate_operations_v4()
     # 旧版本可能把预设存在 SQLite 里，迁移前先确认有没有可用的预设来源
     had_presets = PRESETS_FILE.exists() or bool(_legacy_rows("presets"))
@@ -1226,105 +1531,166 @@ def cleanup_expired_sessions() -> None:
         conn.commit()
 
 
-def list_presets() -> list[dict[str, Any]]:
+def _sorted_presets(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        items, key=lambda item: (0 if item["is_default"] else 1, item["name"])
+    )
+
+
+def list_naming_presets() -> list[dict[str, Any]]:
     doc = _ensure_presets()
-    presets = [_normalize_preset(item, item.get("id")) for item in doc["presets"]]
-    presets.sort(key=lambda item: (0 if item["is_default"] else 1, item["name"]))
-    return presets
+    return _sorted_presets(
+        [_normalize_naming_preset(item, item.get("id")) for item in doc["naming_presets"]]
+    )
+
+
+def list_workflow_presets() -> list[dict[str, Any]]:
+    doc = _ensure_presets()
+    return _sorted_presets(
+        [
+            _normalize_workflow_preset(item, item.get("id"))
+            for item in doc["workflow_presets"]
+        ]
+    )
+
+
+def get_naming_preset(preset_id: str) -> dict[str, Any] | None:
+    return next((item for item in list_naming_presets() if item["id"] == preset_id), None)
+
+
+def get_workflow_preset(preset_id: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in list_workflow_presets() if item["id"] == preset_id), None
+    )
+
+
+def get_default_naming_preset() -> dict[str, Any] | None:
+    presets = list_naming_presets()
+    return next((item for item in presets if item["is_default"]), presets[0] if presets else None)
+
+
+def get_default_workflow_preset() -> dict[str, Any] | None:
+    presets = list_workflow_presets()
+    return next((item for item in presets if item["is_default"]), presets[0] if presets else None)
+
+
+# 兼容旧调用：预览、AI 规律和回归脚本只关心“带模板的那层”，即命名预设。
+def list_presets() -> list[dict[str, Any]]:
+    return list_naming_presets()
 
 
 def get_preset(preset_id: str) -> dict[str, Any] | None:
-    return next((item for item in list_presets() if item["id"] == preset_id), None)
+    return get_naming_preset(preset_id)
 
 
 def get_default_preset() -> dict[str, Any] | None:
-    presets = list_presets()
-    return presets[0] if presets else None
+    return get_default_naming_preset()
 
 
-def _preset_options_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """保存预设时的选项来源：显式传入就沿用，否则记录当前设置快照。"""
+def _naming_options_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """保存命名预设：显式传入就用传入值，否则记录当前设置里的命名部分。"""
     options = payload.get("options")
     if isinstance(options, dict) and options:
         return options
-    return settings_to_preset_options(load_settings())
+    return naming_options_from_settings(load_settings())
 
 
-def create_preset(payload: dict[str, Any]) -> dict[str, Any]:
+def _workflow_options_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """保存工作流预设：显式传入就用传入值，否则记录当前设置里的工作流部分。"""
+    options = payload.get("options")
+    if isinstance(options, dict) and options:
+        return options
+    return workflow_options_from_settings(load_settings())
+
+
+def create_naming_preset(payload: dict[str, Any]) -> dict[str, Any]:
     with _LOCK:
         doc = _ensure_presets()
-        preset = _normalize_preset(
+        preset = _normalize_naming_preset(
             {
                 "id": payload.get("id"),
                 "name": payload.get("name"),
                 "is_default": False,
                 "library_profile": payload.get("library_profile"),
                 "templates": payload.get("templates"),
-                "options": _preset_options_from_payload(payload),
+                "options": _naming_options_from_payload(payload),
             }
         )
-        doc["presets"].append(preset)
+        doc["naming_presets"].append(preset)
         _write_json(PRESETS_FILE, doc)
-    return get_preset(preset["id"])  # type: ignore[return-value]
+    return get_naming_preset(preset["id"])  # type: ignore[return-value]
 
 
-def update_preset(preset_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+def update_naming_preset(
+    preset_id: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
     with _LOCK:
         doc = _ensure_presets()
-        target = next((item for item in doc["presets"] if item["id"] == preset_id), None)
+        target = next(
+            (item for item in doc["naming_presets"] if item["id"] == preset_id), None
+        )
         if target is None:
             return None
-        updated = _normalize_preset(
+        updated = _normalize_naming_preset(
             {
                 "id": preset_id,
                 "name": payload.get("name", target["name"]),
                 "is_default": target["is_default"],
                 "library_profile": payload.get("library_profile", target["library_profile"]),
                 "templates": payload.get("templates", target["templates"]),
-                "options": _preset_options_from_payload(payload),
+                "options": _naming_options_from_payload(payload),
                 "created_at": target["created_at"],
                 "updated_at": _now(),
             }
         )
-        doc["presets"][doc["presets"].index(target)] = updated
+        doc["naming_presets"][doc["naming_presets"].index(target)] = updated
         _write_json(PRESETS_FILE, doc)
-    return get_preset(preset_id)
+    return get_naming_preset(preset_id)
 
 
-def delete_preset(preset_id: str) -> bool:
+def naming_preset_references(preset_id: str) -> list[dict[str, Any]]:
+    """哪些工作流预设正在使用这个命名预设。删除前用来给出明确提示。"""
+    return [
+        {"id": item["id"], "name": item["name"]}
+        for item in list_workflow_presets()
+        if item.get("naming_preset_id") == preset_id
+    ]
+
+
+def delete_naming_preset(preset_id: str) -> bool:
     with _LOCK:
         doc = _ensure_presets()
-        target = next((item for item in doc["presets"] if item["id"] == preset_id), None)
+        target = next(
+            (item for item in doc["naming_presets"] if item["id"] == preset_id), None
+        )
         if target is None:
             return False
-        doc["presets"].remove(target)
-        if doc["presets"] and not any(item["is_default"] for item in doc["presets"]):
-            doc["presets"][0]["is_default"] = True
-        doc["default_id"] = next(
-            (item["id"] for item in doc["presets"] if item["is_default"]), ""
-        )
+        doc["naming_presets"].remove(target)
+        _fix_preset_defaults_and_links(doc["naming_presets"], doc["workflow_presets"])
         _write_json(PRESETS_FILE, doc)
     return True
 
 
-def set_default_preset(preset_id: str) -> dict[str, Any] | None:
+def set_default_naming_preset(preset_id: str) -> dict[str, Any] | None:
     with _LOCK:
         doc = _ensure_presets()
-        target = next((item for item in doc["presets"] if item["id"] == preset_id), None)
+        target = next(
+            (item for item in doc["naming_presets"] if item["id"] == preset_id), None
+        )
         if target is None:
             return None
-        for item in doc["presets"]:
+        for item in doc["naming_presets"]:
             item["is_default"] = item["id"] == preset_id
-        doc["default_id"] = preset_id
+        doc["default_naming_id"] = preset_id
         _write_json(PRESETS_FILE, doc)
-    return get_preset(preset_id)
+    return get_naming_preset(preset_id)
 
 
-def duplicate_preset(preset_id: str) -> dict[str, Any] | None:
-    source = get_preset(preset_id)
+def duplicate_naming_preset(preset_id: str) -> dict[str, Any] | None:
+    source = get_naming_preset(preset_id)
     if not source:
         return None
-    return create_preset(
+    return create_naming_preset(
         {
             "name": f"{source['name']} 副本",
             "library_profile": source["library_profile"],
@@ -1334,33 +1700,175 @@ def duplicate_preset(preset_id: str) -> dict[str, Any] | None:
     )
 
 
+def create_workflow_preset(payload: dict[str, Any]) -> dict[str, Any]:
+    with _LOCK:
+        doc = _ensure_presets()
+        preset = _normalize_workflow_preset(
+            {
+                "id": payload.get("id"),
+                "name": payload.get("name"),
+                "is_default": False,
+                "library_profile": payload.get("library_profile"),
+                "naming_preset_id": payload.get("naming_preset_id"),
+                "options": _workflow_options_from_payload(payload),
+            }
+        )
+        doc["workflow_presets"].append(preset)
+        _fix_preset_defaults_and_links(doc["naming_presets"], doc["workflow_presets"])
+        _write_json(PRESETS_FILE, doc)
+    return get_workflow_preset(preset["id"])  # type: ignore[return-value]
+
+
+def update_workflow_preset(
+    preset_id: str, payload: dict[str, Any]
+) -> dict[str, Any] | None:
+    with _LOCK:
+        doc = _ensure_presets()
+        target = next(
+            (item for item in doc["workflow_presets"] if item["id"] == preset_id), None
+        )
+        if target is None:
+            return None
+        naming_ids = {item["id"] for item in doc["naming_presets"]}
+        naming_preset_id = payload.get("naming_preset_id", target.get("naming_preset_id", ""))
+        if naming_preset_id and naming_preset_id not in naming_ids:
+            raise ValueError("指定的命名预设不存在")
+        updated = _normalize_workflow_preset(
+            {
+                "id": preset_id,
+                "name": payload.get("name", target["name"]),
+                "is_default": target["is_default"],
+                "library_profile": payload.get("library_profile", target["library_profile"]),
+                "naming_preset_id": naming_preset_id,
+                "options": _workflow_options_from_payload(payload),
+                "created_at": target["created_at"],
+                "updated_at": _now(),
+            }
+        )
+        doc["workflow_presets"][doc["workflow_presets"].index(target)] = updated
+        _write_json(PRESETS_FILE, doc)
+    return get_workflow_preset(preset_id)
+
+
+def delete_workflow_preset(preset_id: str) -> bool:
+    with _LOCK:
+        doc = _ensure_presets()
+        target = next(
+            (item for item in doc["workflow_presets"] if item["id"] == preset_id), None
+        )
+        if target is None:
+            return False
+        doc["workflow_presets"].remove(target)
+        _fix_preset_defaults_and_links(doc["naming_presets"], doc["workflow_presets"])
+        _write_json(PRESETS_FILE, doc)
+    return True
+
+
+def set_default_workflow_preset(preset_id: str) -> dict[str, Any] | None:
+    with _LOCK:
+        doc = _ensure_presets()
+        target = next(
+            (item for item in doc["workflow_presets"] if item["id"] == preset_id), None
+        )
+        if target is None:
+            return None
+        for item in doc["workflow_presets"]:
+            item["is_default"] = item["id"] == preset_id
+        doc["default_id"] = preset_id
+        _write_json(PRESETS_FILE, doc)
+    return get_workflow_preset(preset_id)
+
+
+def duplicate_workflow_preset(preset_id: str) -> dict[str, Any] | None:
+    source = get_workflow_preset(preset_id)
+    if not source:
+        return None
+    return create_workflow_preset(
+        {
+            "name": f"{source['name']} 副本",
+            "library_profile": source["library_profile"],
+            "naming_preset_id": source.get("naming_preset_id"),
+            "options": source.get("options"),
+        }
+    )
+
+
 def export_presets() -> dict[str, Any]:
+    """导出两层预设。version 2 是拆分后的结构，导入时仍兼容旧 version 1 文件。"""
     doc = _ensure_presets()
-    presets = []
-    for item in doc["presets"]:
-        preset = _normalize_preset(item, item.get("id"))
+    naming = []
+    for item in doc["naming_presets"]:
+        preset = _normalize_naming_preset(item, item.get("id"))
         preset.pop("created_at", None)
         preset.pop("updated_at", None)
         preset["is_default"] = False
-        presets.append(preset)
-    return {"version": 1, "presets": presets, "default_id": doc.get("default_id")}
+        naming.append(preset)
+    workflow = []
+    for item in doc["workflow_presets"]:
+        preset = _normalize_workflow_preset(item, item.get("id"))
+        preset.pop("created_at", None)
+        preset.pop("updated_at", None)
+        preset["is_default"] = False
+        workflow.append(preset)
+    return {"version": 2, "naming_presets": naming, "workflow_presets": workflow}
 
 
 def import_presets(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """导入预设：新的两层文件直接分层导入，旧版单层文件自动拆成两层。
+
+    导入会生成新的 id，因此工作流预设里指向命名预设的引用要同步换成新 id，
+    否则导进来就会指到不存在的命名预设。
+    """
     created: list[dict[str, Any]] = []
-    for item in payload.get("presets", []):
-        if not isinstance(item, dict):
-            continue
-        created.append(
-            create_preset(
+
+    def _import_naming(items: list[dict[str, Any]]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            result = create_naming_preset(
                 {
-                    "name": str(item.get("name", "导入预设"))[:120],
+                    "name": str(item.get("name", "导入命名预设"))[:120],
                     "library_profile": item.get("library_profile", "generic"),
                     "templates": item.get("templates") or {},
                     "options": item.get("options") or {},
                 }
             )
-        )
+            if isinstance(item.get("id"), str) and item.get("id"):
+                mapping[item["id"]] = result["id"]
+            created.append(result)
+        return mapping
+
+    def _import_workflow(items: list[dict[str, Any]], mapping: dict[str, str]) -> None:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            source_ref = item.get("naming_preset_id")
+            created.append(
+                create_workflow_preset(
+                    {
+                        "name": str(item.get("name", "导入工作流预设"))[:120],
+                        "library_profile": item.get("library_profile", "generic"),
+                        "naming_preset_id": mapping.get(str(source_ref), ""),
+                        "options": item.get("options") or {},
+                    }
+                )
+            )
+
+    if isinstance(payload.get("naming_presets"), list):
+        mapping = _import_naming(list(payload.get("naming_presets") or []))
+        _import_workflow(list(payload.get("workflow_presets") or []), mapping)
+        return created
+    legacy = [
+        item for item in payload.get("presets", []) if isinstance(item, dict)
+    ]
+    if legacy:
+        _migrate_special_templates(legacy)
+        _migrate_episode_resolution_v5(legacy)
+        _migrate_episode_version_v6(legacy)
+        naming, workflow, _record = _split_legacy_presets(legacy, load_settings())
+        mapping = _import_naming(naming)
+        _import_workflow(workflow, mapping)
     return created
 
 
@@ -1547,6 +2055,9 @@ def _item_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "message": row["message"],
         "choice": row["choice"] if "choice" in keys else "",
+        "decision_source": row["decision_source"] if "decision_source" in keys else "",
+        "rule_id": row["rule_id"] if "rule_id" in keys else "",
+        "decided_at": row["decided_at"] if "decided_at" in keys else "",
     }
 
 
@@ -1579,8 +2090,8 @@ def save_operation(
         )
         for seq, item in enumerate(items, start=1):
             conn.execute(
-                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message, decision_source, rule_id, decided_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     operation_id,
                     seq,
@@ -1591,10 +2102,26 @@ def save_operation(
                     item.get("target_path", ""),
                     item.get("status", "skipped"),
                     item.get("message", ""),
+                    item.get("decision_source", ""),
+                    item.get("rule_id", ""),
+                    item.get("decided_at", ""),
                 ),
             )
         conn.commit()
     return get_operation(operation_id)  # type: ignore[return-value]
+
+
+def _decision_map(conn: sqlite3.Connection, scan_id: str | None) -> dict[str, dict[str, Any]]:
+    """同一次扫描里，按 ref_id 取最新的一条决策，供执行条目继承来源。"""
+    if not scan_id:
+        return {}
+    rows = conn.execute(
+        "SELECT * FROM decisions WHERE scan_id = ? ORDER BY created_at", (scan_id,)
+    ).fetchall()
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        result[str(row["ref_id"])] = dict(row)
+    return result
 
 
 def create_pending_operation(
@@ -1625,10 +2152,12 @@ def create_pending_operation(
                 batch_count,
             ),
         )
+        decisions = _decision_map(conn, scan_id)
         for seq, item in enumerate(items, start=1):
+            decision = decisions.get(str(item.get("file_id") or ""))
             conn.execute(
-                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message, decision_source, rule_id, decided_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     operation_id,
                     seq,
@@ -1639,6 +2168,9 @@ def create_pending_operation(
                     item.get("target_path", ""),
                     item.get("status", "planned"),
                     item.get("message", ""),
+                    item.get("decision_source") or (decision or {}).get("source", ""),
+                    item.get("rule_id") or (decision or {}).get("rule_id", ""),
+                    item.get("decided_at") or (decision or {}).get("created_at", ""),
                 ),
             )
         conn.commit()
@@ -1725,8 +2257,8 @@ def insert_operation_items(operation_id: str, items: list[dict[str, Any]]) -> li
         seqs: list[int] = []
         for item in items:
             conn.execute(
-                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message, choice) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO operation_items (operation_id, seq, group_id, file_id, category, original_path, target_path, status, message, choice, decision_source, rule_id, decided_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     operation_id,
                     next_seq,
@@ -1738,6 +2270,9 @@ def insert_operation_items(operation_id: str, items: list[dict[str, Any]]) -> li
                     item.get("status", "planned"),
                     item.get("message", ""),
                     item.get("choice", ""),
+                    item.get("decision_source", ""),
+                    item.get("rule_id", ""),
+                    item.get("decided_at", ""),
                 ),
             )
             seqs.append(next_seq)
@@ -1967,10 +2502,27 @@ def list_operations(limit: int = 20) -> list[dict[str, Any]]:
                 "SELECT operation_id, COUNT(*) AS total FROM operation_items GROUP BY operation_id"
             ).fetchall()
         }
+        decision_rows = conn.execute(
+            "SELECT operation_id, decision_source, COUNT(*) AS total FROM operation_items "
+            "GROUP BY operation_id, decision_source"
+        ).fetchall()
+    decisions: dict[str, dict[str, int]] = {}
+    for item in decision_rows:
+        bucket = decisions.setdefault(
+            item["operation_id"], {"human": 0, "rule": 0, "ai": 0, "unknown": 0}
+        )
+        key = str(item["decision_source"] or "")
+        if key in bucket:
+            bucket[key] += int(item["total"])
+        else:
+            bucket["unknown"] += int(item["total"])
     operations = []
     for row in rows:
         data = _operation_from_row(row)
         data["item_count"] = counts.get(row["id"], 0)
+        data["decision_counts"] = decisions.get(
+            row["id"], {"human": 0, "rule": 0, "ai": 0, "unknown": 0}
+        )
         operations.append(data)
     return operations
 
@@ -1980,6 +2532,745 @@ def mark_operation_status(operation_id: str, status: str) -> None:
         conn.execute(
             "UPDATE operations SET status = ?, undone_at = ? WHERE id = ?",
             (status, _now() if status == "undone" else None, operation_id),
+        )
+        conn.commit()
+
+
+# ---------------------------------------------------------------- 运行记录
+
+
+RUN_STAGES = RUN_STAGE_ORDER
+RUN_STAGE_LABELS = {
+    "scan": "扫描",
+    "match": "匹配作品",
+    "preview": "模板与预览",
+    "execute": "执行",
+    "done": "完成",
+}
+
+
+def _run_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        groups = json.loads(row["groups"] or "[]")
+    except (TypeError, ValueError):
+        groups = []
+    try:
+        snapshot = json.loads(row["snapshot"] or "{}")
+    except (TypeError, ValueError):
+        snapshot = {}
+    stage = str(row["stage"] or "scan")
+    return {
+        "id": row["id"],
+        "scan_id": row["scan_id"],
+        "stage": stage,
+        "stage_label": RUN_STAGE_LABELS.get(stage, stage),
+        "status": row["status"],
+        "preset_id": row["preset_id"],
+        "operation_id": row["operation_id"],
+        "groups": groups if isinstance(groups, list) else [],
+        "snapshot": snapshot if isinstance(snapshot, dict) else {},
+        "lock_owner": row["lock_owner"],
+        "lock_expires_at": row["lock_expires_at"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def _run_row(conn: sqlite3.Connection, run_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+
+
+def ensure_run(
+    scan_id: str,
+    groups: list[dict[str, Any]] | None = None,
+    preset_id: str | None = None,
+    naming_preset_id: str | None = None,
+) -> dict[str, Any]:
+    """取这次扫描对应的运行；没有就新建一条。一次扫描从开始到完成算一次运行。
+
+    本次运行使用的命名预设记在 snapshot.naming_preset_id：自动推进时以此为准，
+    中途在界面上换预设不会让前后步骤用不同的命名规则。
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE scan_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scan_id,),
+        ).fetchone()
+        if row is not None:
+            updates: list[str] = []
+            values: list[Any] = []
+            if groups and not json.loads(row["groups"] or "[]"):
+                updates.append("groups = ?")
+                values.append(json.dumps(groups, ensure_ascii=False))
+            try:
+                snapshot = json.loads(row["snapshot"] or "{}")
+            except (TypeError, ValueError):
+                snapshot = {}
+            # 进入执行阶段后不再改这个记录：避免自动推进中途换预设导致前后不一致。
+            if (
+                naming_preset_id
+                and snapshot.get("naming_preset_id") != naming_preset_id
+                and row["stage"] in ("scan", "match", "preview")
+            ):
+                snapshot["naming_preset_id"] = naming_preset_id
+                updates.append("snapshot = ?")
+                values.append(json.dumps(snapshot, ensure_ascii=False))
+            if updates:
+                updates.append("updated_at = ?")
+                values.append(_now())
+                values.append(row["id"])
+                conn.execute(
+                    f"UPDATE runs SET {', '.join(updates)} WHERE id = ?", values
+                )
+                conn.commit()
+                row = _run_row(conn, row["id"])
+            return _run_from_row(row)  # type: ignore[arg-type]
+        now = _now()
+        run_id = f"run-{uuid.uuid4().hex[:12]}"
+        snapshot = {"naming_preset_id": naming_preset_id} if naming_preset_id else {}
+        conn.execute(
+            "INSERT INTO runs (id, scan_id, stage, status, preset_id, groups, snapshot, created_at, updated_at) "
+            "VALUES (?, ?, 'scan', 'active', ?, ?, ?, ?, ?)",
+            (
+                run_id,
+                scan_id,
+                preset_id,
+                json.dumps(groups or [], ensure_ascii=False),
+                json.dumps(snapshot, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        row = _run_row(conn, run_id)
+    return _run_from_row(row)  # type: ignore[arg-type]
+
+
+def get_run(run_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = _run_row(conn, run_id)
+    return _run_from_row(row) if row is not None else None
+
+
+def run_for_scan(scan_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE scan_id = ? AND status = 'active' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (scan_id,),
+        ).fetchone()
+    return _run_from_row(row) if row is not None else None
+
+
+def current_run() -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM runs WHERE status = 'active' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+    return _run_from_row(row) if row is not None else None
+
+
+def update_run(
+    run_id: str,
+    stage: str | None = None,
+    snapshot_patch: dict[str, Any] | None = None,
+    preset_id: str | None = None,
+    operation_id: str | None = None,
+    status: str | None = None,
+    event_source: str = "human",
+    event_rule_id: str = "",
+    actor: str = "",
+) -> dict[str, Any] | None:
+    """推进运行阶段。阶段只前进不后退，避免来回切页面把“上次停在哪”冲掉。"""
+    with _connect() as conn:
+        row = _run_row(conn, run_id)
+        if row is None:
+            return None
+        current_stage = str(row["stage"] or "scan")
+        next_stage = current_stage
+        if stage in RUN_STAGES:
+            if RUN_STAGES.index(stage) > RUN_STAGES.index(current_stage) or current_stage == "done":
+                next_stage = stage if current_stage != "done" else current_stage
+        try:
+            snapshot = json.loads(row["snapshot"] or "{}")
+        except (TypeError, ValueError):
+            snapshot = {}
+        if snapshot_patch:
+            for key, value in snapshot_patch.items():
+                snapshot[key] = value
+        now = _now()
+        fields = ["stage = ?", "snapshot = ?", "updated_at = ?"]
+        values: list[Any] = [next_stage, json.dumps(snapshot, ensure_ascii=False), now]
+        if preset_id is not None:
+            fields.append("preset_id = ?")
+            values.append(preset_id)
+        if operation_id is not None:
+            fields.append("operation_id = ?")
+            values.append(operation_id)
+        if status is not None:
+            fields.append("status = ?")
+            values.append(status)
+        values.append(run_id)
+        conn.execute(f"UPDATE runs SET {', '.join(fields)} WHERE id = ?", values)
+        if stage in RUN_STAGES and next_stage != current_stage:
+            append_run_event(
+                run_id,
+                "stage",
+                f"阶段：{RUN_STAGE_LABELS.get(current_stage, current_stage)} → "
+                f"{RUN_STAGE_LABELS.get(next_stage, next_stage)}",
+                stage=next_stage,
+                detail={"from": current_stage, "to": next_stage},
+                source=event_source,
+                rule_id=event_rule_id,
+                actor=actor,
+                scan_id=str(row["scan_id"] or ""),
+                conn=conn,
+            )
+        conn.commit()
+        row = _run_row(conn, run_id)
+    return _run_from_row(row)  # type: ignore[arg-type]
+
+
+def claim_run(run_id: str, owner: str, ttl_seconds: int = 3600) -> bool:
+    """简单租约：同一时间只允许一个推进者。租约过期后其他人可以接手。"""
+    now = _now()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE runs SET lock_owner = ?, lock_expires_at = ?, updated_at = ? "
+            "WHERE id = ? AND (lock_owner = '' OR lock_expires_at = '' "
+            "OR lock_expires_at <= ? OR lock_owner = ?)",
+            (owner, _run_deadline(ttl_seconds), now, run_id, now, owner),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0) > 0
+
+
+def release_run(run_id: str, owner: str = "") -> None:
+    with _connect() as conn:
+        if owner:
+            conn.execute(
+                "UPDATE runs SET lock_owner = '', lock_expires_at = '', updated_at = ? "
+                "WHERE id = ? AND lock_owner = ?",
+                (_now(), run_id, owner),
+            )
+        else:
+            conn.execute(
+                "UPDATE runs SET lock_owner = '', lock_expires_at = '', updated_at = ? WHERE id = ?",
+                (_now(), run_id),
+            )
+        conn.commit()
+
+
+def clear_run_locks() -> None:
+    """进程刚启动时没有任何后台推进者，所有租约都是上次遗留的，直接清空。"""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE runs SET lock_owner = '', lock_expires_at = '' WHERE lock_owner != ''"
+        )
+        conn.commit()
+
+
+def _run_deadline(ttl_seconds: int) -> str:
+    from datetime import timedelta
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(5, ttl_seconds))).isoformat()
+
+
+# ---------------------------------------------------------------- 运行事件流水
+
+
+RUN_EVENT_KIND_LABELS = {
+    "stage": "阶段切换",
+    "human": "人工确认",
+    "rule": "规则自动",
+    "ai": "AI 决策",
+    "gate": "门槛检查",
+    "authorization": "自动执行授权",
+    "execute": "执行",
+}
+
+
+def _run_event_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        detail = json.loads(row["detail"] or "{}")
+    except (TypeError, ValueError):
+        detail = {}
+    kind = str(row["kind"] or "")
+    stage = str(row["stage"] or "")
+    source = str(row["source"] or "")
+    return {
+        "id": int(row["id"]),
+        "run_id": row["run_id"],
+        "scan_id": row["scan_id"],
+        "kind": kind,
+        "kind_label": RUN_EVENT_KIND_LABELS.get(kind, kind),
+        "stage": stage,
+        "stage_label": RUN_STAGE_LABELS.get(stage, stage),
+        "title": row["title"],
+        "detail": detail if isinstance(detail, dict) else {},
+        "source": source,
+        "source_label": DECISION_SOURCE_LABELS.get(source, "未知"),
+        "rule_id": row["rule_id"],
+        "actor": row["actor"],
+        "created_at": row["created_at"],
+    }
+
+
+def append_run_event(
+    run_id: str,
+    kind: str,
+    title: str,
+    *,
+    stage: str = "",
+    detail: dict[str, Any] | None = None,
+    source: str = "human",
+    rule_id: str = "",
+    actor: str = "",
+    scan_id: str = "",
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    """追加一条运行事件。自增 id 就是时间顺序，按它回放即可还原这次运行。"""
+    now = _now()
+    payload = json.dumps(detail or {}, ensure_ascii=False)
+    sql = (
+        "INSERT INTO run_events (run_id, scan_id, kind, stage, title, detail, source, rule_id, "
+        "actor, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    values = (run_id, scan_id, kind, stage, title, payload, source, rule_id, actor, now)
+    if conn is None:
+        with _connect() as own:
+            cursor = own.execute(sql, values)
+            own.commit()
+    else:
+        cursor = conn.execute(sql, values)
+    return {
+        "id": int(cursor.lastrowid or 0),
+        "run_id": run_id,
+        "scan_id": scan_id,
+        "kind": kind,
+        "kind_label": RUN_EVENT_KIND_LABELS.get(kind, kind),
+        "stage": stage,
+        "stage_label": RUN_STAGE_LABELS.get(stage, stage),
+        "title": title,
+        "detail": detail or {},
+        "source": source,
+        "source_label": DECISION_SOURCE_LABELS.get(source, "未知"),
+        "rule_id": rule_id,
+        "actor": actor,
+        "created_at": now,
+    }
+
+
+def list_run_events(run_id: str, limit: int = 500) -> list[dict[str, Any]]:
+    """按自增 id 正序返回，保证是这次运行真实发生的顺序。"""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM run_events WHERE run_id = ? ORDER BY id ASC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+    return [_run_event_from_row(row) for row in rows]
+
+
+# ---------------------------------------------------------------- 待人工清单
+
+
+def _pending_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    try:
+        meta = json.loads(row["meta"] or "{}")
+    except (TypeError, ValueError):
+        meta = {}
+    kind = str(row["kind"] or "")
+    return {
+        "id": row["id"],
+        "run_id": row["run_id"],
+        "scan_id": row["scan_id"],
+        "kind": kind,
+        "kind_label": PENDING_KIND_LABELS.get(kind, kind),
+        "ref_type": row["ref_type"],
+        "ref_id": row["ref_id"],
+        "title": row["title"],
+        "reason": row["reason"],
+        "blocking": bool(row["blocking"]),
+        "status": row["status"],
+        "resolved_by": row["resolved_by"],
+        "resolved_at": row["resolved_at"],
+        "decision_source": row["decision_source"],
+        "decision_source_label": DECISION_SOURCE_LABELS.get(
+            str(row["decision_source"] or ""), "未知"
+        ),
+        "meta": meta if isinstance(meta, dict) else {},
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+PENDING_KIND_LABELS = {
+    "unassigned": "未归属文件",
+    "season": "季号未定",
+    "conflict": "冲突未选",
+    "special": "特典归属待确认",
+    "preview_warning": "预览警告",
+    "preview_error": "预览错误",
+}
+
+
+def list_pending_items(run_id: str, include_resolved: bool = False) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        if include_resolved:
+            rows = conn.execute(
+                "SELECT * FROM pending_items WHERE run_id = ? ORDER BY created_at", (run_id,)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM pending_items WHERE run_id = ? AND status = 'open' "
+                "ORDER BY blocking DESC, created_at",
+                (run_id,),
+            ).fetchall()
+    return [_pending_from_row(row) for row in rows]
+
+
+def pending_counts(run_id: str) -> dict[str, int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS total FROM pending_items WHERE run_id = ? GROUP BY status",
+            (run_id,),
+        ).fetchall()
+    counts = {"open": 0, "resolved": 0, "blocking": 0}
+    for row in rows:
+        counts[str(row["status"])] = int(row["total"])
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS total FROM pending_items "
+            "WHERE run_id = ? AND status = 'open' AND blocking = 1",
+            (run_id,),
+        ).fetchone()
+    counts["blocking"] = int(row["total"] if row else 0)
+    counts["total"] = counts["open"] + counts["resolved"]
+    return counts
+
+
+def sync_pending_items(run_id: str, scan_id: str, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """用最新计算结果对齐清单：新问题加进来，已经处理掉的问题自动关闭。"""
+    now = _now()
+    with _connect() as conn:
+        rows = conn.execute("SELECT * FROM pending_items WHERE run_id = ?", (run_id,)).fetchall()
+        existing = {(str(row["kind"]), str(row["ref_id"])): row for row in rows}
+        seen: set[tuple[str, str]] = set()
+        for item in items:
+            kind = str(item.get("kind") or "")
+            ref_id = str(item.get("ref_id") or "")
+            if not kind or not ref_id:
+                continue
+            key = (kind, ref_id)
+            seen.add(key)
+            row = existing.get(key)
+            meta = json.dumps(item.get("meta") or {}, ensure_ascii=False)
+            if row is None:
+                conn.execute(
+                    "INSERT INTO pending_items (id, run_id, scan_id, kind, ref_type, ref_id, title, reason, "
+                    "blocking, status, decision_source, meta, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)",
+                    (
+                        f"pd-{uuid.uuid4().hex[:12]}",
+                        run_id,
+                        scan_id,
+                        kind,
+                        str(item.get("ref_type") or ""),
+                        ref_id,
+                        str(item.get("title") or ""),
+                        str(item.get("reason") or ""),
+                        1 if item.get("blocking") else 0,
+                        str(item.get("decision_source") or ""),
+                        meta,
+                        now,
+                        now,
+                    ),
+                )
+                continue
+            conn.execute(
+                "UPDATE pending_items SET scan_id = ?, ref_type = ?, title = ?, reason = ?, "
+                "blocking = ?, status = 'open', resolved_by = '', resolved_at = '', "
+                "decision_source = ?, meta = ?, updated_at = ? WHERE id = ?",
+                (
+                    scan_id,
+                    str(item.get("ref_type") or ""),
+                    str(item.get("title") or ""),
+                    str(item.get("reason") or ""),
+                    1 if item.get("blocking") else 0,
+                    str(item.get("decision_source") or ""),
+                    meta,
+                    now,
+                    row["id"],
+                ),
+            )
+        for key, row in existing.items():
+            if key in seen or str(row["status"]) != "open":
+                continue
+            conn.execute(
+                "UPDATE pending_items SET status = 'resolved', resolved_by = ?, resolved_at = ?, "
+                "updated_at = ? WHERE id = ?",
+                ("系统自动", now, now, row["id"]),
+            )
+        conn.commit()
+    return list_pending_items(run_id)
+
+
+# ---------------------------------------------------------------- 决策来源
+
+
+DECISION_SOURCE_LABELS = {
+    "human": "人工确认",
+    "rule": "规则自动",
+    "ai": "AI 决策（预留）",
+    "": "未知",
+}
+
+DECISION_KIND_LABELS = {
+    "assign": "指派作品",
+    "match": "TMDB 匹配",
+    "rename": "手动改名",
+    "season": "季号选择",
+    "conflict": "冲突处理",
+    "auto_authorize": "自动执行授权",
+    "auto_execute": "自动执行",
+    "advance": "推进运行",
+}
+
+
+def record_decision(
+    scan_id: str,
+    kind: str,
+    ref_id: str,
+    choice: str = "",
+    source: str = "human",
+    rule_id: str = "",
+    note: str = "",
+    operation_id: str = "",
+    run_id: str = "",
+) -> dict[str, Any]:
+    """记一条“谁拍的板”。source 预留 ai，以后接 AI 只多一个取值，不改表结构。"""
+    if source not in ("human", "rule", "ai"):
+        source = "human"
+    if not run_id:
+        run = ensure_run(scan_id) if scan_id else None
+        run_id = str((run or {}).get("id") or "")
+    decision_id = f"dc-{uuid.uuid4().hex[:12]}"
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO decisions (id, run_id, scan_id, operation_id, kind, ref_id, choice, source, rule_id, note, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                decision_id,
+                run_id,
+                scan_id,
+                operation_id,
+                kind,
+                ref_id,
+                choice,
+                source,
+                rule_id,
+                note,
+                now,
+            ),
+        )
+        if run_id:
+            append_run_event(
+                run_id,
+                source,
+                f"{DECISION_KIND_LABELS.get(kind, kind)}（{DECISION_SOURCE_LABELS.get(source, '未知')}）",
+                detail={
+                    "kind": kind,
+                    "ref_id": ref_id,
+                    "choice": choice,
+                    "operation_id": operation_id,
+                    "note": note,
+                },
+                source=source,
+                rule_id=rule_id,
+                scan_id=scan_id,
+                conn=conn,
+            )
+        conn.commit()
+    return {
+        "id": decision_id,
+        "run_id": run_id,
+        "scan_id": scan_id,
+        "operation_id": operation_id,
+        "kind": kind,
+        "ref_id": ref_id,
+        "choice": choice,
+        "source": source,
+        "source_label": DECISION_SOURCE_LABELS.get(source, "未知"),
+        "rule_id": rule_id,
+        "note": note,
+        "created_at": now,
+    }
+
+
+def list_decisions(scan_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        if scan_id:
+            rows = conn.execute(
+                "SELECT * FROM decisions WHERE scan_id = ? ORDER BY created_at DESC LIMIT ?",
+                (scan_id, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM decisions ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+    result = []
+    for row in rows:
+        data = dict(row)
+        data["source_label"] = DECISION_SOURCE_LABELS.get(str(row["source"] or ""), "未知")
+        result.append(data)
+    return result
+
+
+def update_operation_item_decision(
+    operation_id: str, seq: int, source: str, rule_id: str = "", decided_at: str = ""
+) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE operation_items SET decision_source = ?, rule_id = ?, decided_at = ? "
+            "WHERE operation_id = ? AND seq = ?",
+            (source, rule_id, decided_at or _now(), operation_id, seq),
+        )
+        conn.commit()
+
+
+def operation_decision_counts(operation_id: str) -> dict[str, int]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT decision_source, COUNT(*) AS total FROM operation_items "
+            "WHERE operation_id = ? GROUP BY decision_source",
+            (operation_id,),
+        ).fetchall()
+    counts = {"human": 0, "rule": 0, "ai": 0, "unknown": 0}
+    for row in rows:
+        key = str(row["decision_source"] or "")
+        if key in counts:
+            counts[key] += int(row["total"])
+        else:
+            counts["unknown"] += int(row["total"])
+    return counts
+
+
+# ---------------------------------------------------------------- 自动执行授权
+
+
+AUTO_AUTH_STATUS_LABELS = {
+    "granted": "已授权",
+    "consumed": "已使用",
+    "revoked": "已撤销",
+}
+
+
+def _auto_auth_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    status = str(row["status"] or "")
+    return {
+        "id": row["id"],
+        "run_id": row["run_id"],
+        "scan_id": row["scan_id"],
+        "operation_id": row["operation_id"],
+        "confirmed_by": row["confirmed_by"],
+        "risk_version": row["risk_version"],
+        "risk_text": row["risk_text"],
+        "gate_checked_at": row["gate_checked_at"],
+        "status": status,
+        "status_label": AUTO_AUTH_STATUS_LABELS.get(status, status),
+        "created_at": row["created_at"],
+        "consumed_at": row["consumed_at"],
+    }
+
+
+def create_auto_authorization(
+    *,
+    run_id: str,
+    scan_id: str = "",
+    confirmed_by: str,
+    risk_version: str,
+    risk_text: str = "",
+    gate_checked_at: str = "",
+) -> dict[str, Any]:
+    """每次自动执行单独生成一条授权；确认人、时间、风险文案版本、运行编号都留档。"""
+    name = str(confirmed_by or "").strip()
+    if not name:
+        raise ValueError("必须填写确认人")
+    if not str(run_id or "").strip():
+        raise ValueError("授权必须绑定到一次运行")
+    auth_id = f"au-{uuid.uuid4().hex[:12]}"
+    now = _now()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO auto_authorizations "
+            "(id, run_id, scan_id, confirmed_by, risk_version, risk_text, gate_checked_at, "
+            "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'granted', ?)",
+            (auth_id, run_id, scan_id, name, risk_version, risk_text, gate_checked_at, now),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM auto_authorizations WHERE id = ?", (auth_id,)
+        ).fetchone()
+    return _auto_auth_from_row(row)  # type: ignore[arg-type]
+
+
+def get_auto_authorization(auth_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM auto_authorizations WHERE id = ?", (auth_id,)
+        ).fetchone()
+    return _auto_auth_from_row(row) if row is not None else None
+
+
+def list_auto_authorizations(run_id: str, limit: int = 50) -> list[dict[str, Any]]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM auto_authorizations WHERE run_id = ? ORDER BY created_at DESC LIMIT ?",
+            (run_id, limit),
+        ).fetchall()
+    return [_auto_auth_from_row(row) for row in rows]
+
+
+def latest_granted_authorization(run_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT * FROM auto_authorizations WHERE run_id = ? AND status = 'granted' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (run_id,),
+        ).fetchone()
+    return _auto_auth_from_row(row) if row is not None else None
+
+
+def consume_auto_authorization(auth_id: str) -> bool:
+    """原子消费：同一授权只能放行一次自动执行。"""
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE auto_authorizations SET status = 'consumed', consumed_at = ? "
+            "WHERE id = ? AND status = 'granted'",
+            (_now(), auth_id),
+        )
+        conn.commit()
+        return int(cursor.rowcount or 0) > 0
+
+
+def restore_auto_authorization(auth_id: str) -> None:
+    """执行没有真正启动（例如预检要求确认）时，把刚消费的授权退回可用状态。"""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE auto_authorizations SET status = 'granted', consumed_at = '' "
+            "WHERE id = ? AND status = 'consumed'",
+            (auth_id,),
+        )
+        conn.commit()
+
+
+def attach_auto_authorization_operation(auth_id: str, operation_id: str) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE auto_authorizations SET operation_id = ? WHERE id = ?",
+            (operation_id, auth_id),
         )
         conn.commit()
 

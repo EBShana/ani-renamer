@@ -265,16 +265,19 @@ POST /api/history/{id}/undo
   `operation_items` 带 `group_id`，撤销时按组快照判断路径是否越界。
   旧版本库里的 `presets` / `rules` 表在启动时会自动迁移进 JSON，之后不再使用。
 
-预设选项（`PRESET_OPTION_KEYS`）与全局设置的对应关系仍然保留，但用途已经改变：
+预设从 v7 起分成两层，选项与全局设置的对应关系见 `NAMING_PRESET_OPTION_KEYS`（13 项）
+和 `WORKFLOW_PRESET_OPTION_KEYS`（23 项）。`providers.tmdb_lang` 与
+`metadata.name_language_order` 是全局语言设置，两层都不保存。
 从 v2 起，**运行期（扫描 / 匹配 / 预览 / 执行）只读 `load_settings()`**，预设不再覆盖设置。
 预设选项只在两种情况下使用：
-1. 保存预设时，把当前设置打包成快照写进 `options`；
-2. 用户切换预设时，前端弹出差异确认，确认后通过 `POST /presets/{id}/apply-settings` 写回设置。
+1. 保存预设时，把当前设置里对应那一层的值打包成快照写进 `options`；
+2. 用户切换预设时，前端弹出差异确认，确认后通过
+   `POST /naming-presets/{id}/apply-settings` 或 `POST /workflow-presets/{id}/apply-settings` 写回设置。
 
 新增可配置项时：
 1. 在 `SETTING_SPECS` 加一条；
-2. 如果它属于“工作流、希望随预设快照记录”，再在 `PRESET_OPTION_KEYS` 加映射；
-3. 前端 `types.ts` 的 `PresetOptions` 同步加字段（设置页会自动出现）。
+2. 判断它属于命名层还是工作流层，再加进对应的 `*_PRESET_OPTION_KEYS`；
+3. 前端 `types.ts` 的 `NamingPresetOptions` / `WorkflowPresetOptions` 同步加字段（设置页会自动出现）。
 
 ### 6.2 模板引擎（`core/template.py`）
 
@@ -535,8 +538,8 @@ POST /api/history/{id}/undo
 4. **路径必须限制在该目录组内**：源路径属于组源目录、目标路径属于组目标目录，
    只允许“组内移动”，禁止跨组；落盘前用 `is_within` 校验。
 5. **配置项单一来源**：设置键在 `config.SETTING_SPECS`；运行期只读 `load_settings()`，预设不再覆盖设置；
-   如果要让某个设置随预设快照记录，再把它加进 `PRESET_OPTION_KEYS`。
-   预设本身只保存三种命名规则（正片 / 特典 / 剧场版）。
+   如果要让某个设置随预设快照记录，再把它加进 `NAMING_PRESET_OPTION_KEYS` 或
+   `WORKFLOW_PRESET_OPTION_KEYS`。命名预设只保存三种命名规则（正片 / 特典 / 剧场版）。
 6. **预设 / 目录组文件读写要原子化**：用 `store._write_json`（临时文件 + `os.replace`），不要直接 open 覆盖。
 7. **TMDB 调用要容错**：外部请求失败不能中断整批；给出可读的 `message`，必要时重试；代理密码不要打日志。
 8. **中文文案**：界面和提示全部中文，面向非程序员用户，措辞直白。

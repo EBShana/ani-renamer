@@ -13,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from .api import (
     routes_ai,
     routes_auth,
+    routes_auto,
     routes_execute,
     routes_groups,
     routes_identify,
@@ -20,12 +21,13 @@ from .api import (
     routes_meta,
     routes_presets,
     routes_queue,
+    routes_runs,
     routes_scan,
 )
 from .config import BASE_DIR
 from .core import auth
 from .core.operations import refresh_interrupted_summaries
-from .store import init_db, mark_interrupted_operations
+from .store import init_db, mark_interrupted_operations, clear_run_locks
 
 STATIC_DIR = BASE_DIR / "app" / "static"
 logger = logging.getLogger("anime_renamer")
@@ -36,6 +38,8 @@ async def lifespan(app: FastAPI):
     init_db()
     # 容器重启后，内存里的后台任务已经消失：把未完成记录标成“已中断”，历史里可以续跑
     mark_interrupted_operations()
+    # 后台推进者已经随进程消失，清掉遗留租约，界面上不会一直显示“被占用”
+    clear_run_locks()
     # 进程被杀时来不及刷新摘要，启动时补齐，避免历史页“结果”显示 0
     refresh_interrupted_summaries()
     yield
@@ -82,6 +86,8 @@ app.include_router(routes_ai.router, prefix="/api", tags=["ai"])
 app.include_router(routes_presets.router, prefix="/api", tags=["presets"])
 app.include_router(routes_match.router, prefix="/api", tags=["match"])
 app.include_router(routes_execute.router, prefix="/api", tags=["execute"])
+app.include_router(routes_runs.router, prefix="/api", tags=["runs"])
+app.include_router(routes_auto.router, prefix="/api", tags=["auto"])
 
 
 @app.exception_handler(Exception)

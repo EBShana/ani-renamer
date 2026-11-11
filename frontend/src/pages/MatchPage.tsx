@@ -20,7 +20,6 @@ import {
   message,
 } from "antd";
 import {
-  ArrowRightOutlined,
   LinkOutlined,
   RobotOutlined,
   SearchOutlined,
@@ -53,6 +52,7 @@ import type {
 } from "../types";
 import UnassignedPanel from "./UnassignedPanel";
 import type { AssignPayload } from "./UnassignedPanel";
+import PageSections from "../components/SectionNav";
 import ListFilterBar, { EMPTY_FILTER, type ListFilterValue } from "../listFilters";
 
 const { Text, Title } = Typography;
@@ -1167,7 +1167,7 @@ export default function MatchPage({
           <div style={{ marginTop: 8 }}>
             将写入 <strong>{written}</strong> 行识别结果，跳过 <strong>{target.movies}</strong> 行（剧场版不参与）。
           </div>
-          <div style={{ marginTop: 8, color: "#888" }}>
+          <div style={{ marginTop: 8, color: "var(--ani-text-tertiary)" }}>
             只改识别结果，不改文件名。应用前会再自检一次，不通过就整批取消。
           </div>
         </div>
@@ -1553,8 +1553,26 @@ export default function MatchPage({
   }
 
   return (
+    <PageSections
+      items={[
+        { id: "sec-match", label: "匹配作品" },
+        ...(!scan.is_sample ? [{ id: "sec-ai-pattern", label: "AI 命名规律" }] : []),
+        ...(overview ? [{ id: "sec-unassigned", label: "未归属区" }] : []),
+        ...(overview && overview.collections.length > 0
+          ? [{ id: "sec-collections", label: "合集文件" }]
+          : []),
+        { id: "sec-works", label: "本页作品清单" },
+      ]}
+      primaryAction={{
+        label: "下一步",
+        hint: `${checkedWorks.length}/${groups.length}`,
+        disabled: checkedWorks.length === 0 || carrying,
+        loading: carrying,
+        onClick: () => void carryNext(),
+      }}
+    >
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card>
+      <Card id="sec-match" data-section>
         <Row gutter={16} align="middle">
           <Col flex="auto">
             <Title level={5} style={{ marginTop: 0 }}>
@@ -1605,9 +1623,6 @@ export default function MatchPage({
                 已选（筛选后）{filteredSelected} 个作品 · 筛选结果 {filteredGroups.length} 个 / 总已选{" "}
                 {checkedWorks.length}
               </Text>
-              <Button type="primary" icon={<ArrowRightOutlined />} loading={carrying} onClick={carryNext}>
-                下一步：带出 {checkedWorks.length} 个作品 → 模板与预览
-              </Button>
             </Space>
           </Col>
         </Row>
@@ -1619,6 +1634,8 @@ export default function MatchPage({
 
       {!scan.is_sample && (
         <Card
+          id="sec-ai-pattern"
+          data-section
           title={
             <Space>
               <RobotOutlined />
@@ -1674,7 +1691,8 @@ export default function MatchPage({
         ))}
 
       {overview && (
-        <UnassignedPanel
+        <div id="sec-unassigned" data-section>
+          <UnassignedPanel
           scan={scan}
           overview={overview}
           works={groups}
@@ -1701,10 +1719,13 @@ export default function MatchPage({
                   : ""
           }
         />
+        </div>
       )}
 
       {overview && overview.collections.length > 0 && (
         <Card
+          id="sec-collections"
+          data-section
           title="合集文件（一个视频含多集）"
           extra={<Text type="secondary">共 {overview.collections.length} 个</Text>}
         >
@@ -1775,7 +1796,7 @@ export default function MatchPage({
         />
       )}
 
-      <Card title="本页作品清单（按作品折叠）">
+      <Card id="sec-works" data-section title="本页作品清单（按作品折叠）">
         <Text type="secondary" style={{ display: "block", marginBottom: 12 }}>
           这里只显示已经从扫描页带出来的作品。没带出的作品留在扫描页，可以之后再带。
           勾选作品后点「下一步」就会移到「模板与预览」，同一部作品不会重复出现。
@@ -1833,7 +1854,7 @@ export default function MatchPage({
                     gap: 12,
                     alignItems: "flex-start",
                     padding: "10px 0",
-                    borderBottom: "1px solid #f0f0f0",
+                    borderBottom: "1px solid var(--ani-border)",
                   }}
                 >
                   <div style={{ flex: 1 }}>
@@ -2113,11 +2134,11 @@ export default function MatchPage({
                           width: 54,
                           height: 80,
                           borderRadius: 4,
-                          background: "#f1f3f5",
+                          background: "var(--ani-subtle)",
                           display: "flex",
                           alignItems: "center",
                           justifyContent: "center",
-                          color: "#adb5bd",
+                          color: "var(--ani-text-tertiary)",
                           fontSize: 12,
                         }}
                       >
@@ -2365,5 +2386,6 @@ export default function MatchPage({
         )}
       </Modal>
     </Space>
+    </PageSections>
   );
 }

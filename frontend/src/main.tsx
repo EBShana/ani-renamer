@@ -1,15 +1,14 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { ConfigProvider } from "antd";
-import zhCN from "antd/locale/zh_CN";
 import "antd/dist/reset.css";
 import App from "./App";
+import { ThemeRoot } from "./theme";
 import "./styles.css";
 
 ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
   <React.StrictMode>
-    <ConfigProvider locale={zhCN} theme={{ token: { borderRadius: 8 } }}>
+    <ThemeRoot>
       <App />
-    </ConfigProvider>
+    </ThemeRoot>
   </React.StrictMode>,
 );

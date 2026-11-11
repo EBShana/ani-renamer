@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -98,6 +99,18 @@ def main() -> int:
             validate_structure,
         )
         from app.core.pattern_sample import sample_filenames  # noqa: E402
+        from app.core.auto_execute import (  # noqa: E402
+            AUTO_EXECUTE_RISK_TEXT,
+            AUTO_EXECUTE_RISK_VERSION,
+            auto_execute_refusal,
+        )
+        from app.core.gate import evaluate_gate  # noqa: E402
+        from app.core.run_advance import (  # noqa: E402
+            AdvanceError,
+            can_mark_done,
+            validate_advance,
+        )
+        from app.core.pending import collect_pending  # noqa: E402
         from app.core.identify import apply_identification, confirm_all  # noqa: E402
         from app.core.operations import build_plan, create_operation  # noqa: E402
         from app.core.parser import (  # noqa: E402
@@ -110,19 +123,39 @@ def main() -> int:
         from app.core.scanner import scan_groups  # noqa: E402
         from app.core.template import build_filename  # noqa: E402
         from app.store import (  # noqa: E402
+            append_run_event,
+            claim_run,
+            clear_run_locks,
+            consume_auto_authorization,
+            create_auto_authorization,
+            create_pending_operation,
             create_rule,
             delete_rule,
+            ensure_run,
             finalize_operation,
+            get_auto_authorization,
             get_operation,
+            get_run,
             init_db,
+            latest_granted_authorization,
+            list_decisions,
+            list_pending_items,
+            list_run_events,
             list_presets,
             list_rule_dicts,
             list_rules,
+            operation_decision_counts,
+            pending_counts,
             pending_operation_items,
+            record_decision as record_store_decision,
+            release_run,
             reset_builtin_rules,
+            restore_auto_authorization,
             set_operation_status,
+            sync_pending_items,
             update_operation_item,
             update_rule,
+            update_run,
             DEFAULT_TEMPLATES,
         )
 
@@ -411,50 +444,254 @@ def main() -> int:
         )
         save_settings({"parse.write_ignore_markers": True})
 
-        # ---------------- 3d2. 预设快照：执行类设置也要跟着预设走 ----------------
+        # ---------------- 3d2. 两层预设快照：命名层与工作流层各管各的 ----------------
         from app.config import (  # noqa: E402
-            PRESET_OPTION_KEYS,
-            setting_values_from_preset_options,
-            settings_to_preset_options,
+            NAMING_PRESET_OPTION_KEYS,
+            PRESET_EXCLUDED_KEYS,
+            SETTING_SPECS,
+            WORKFLOW_PRESET_OPTION_KEYS,
+            naming_options_from_settings,
+            naming_settings_from_options,
+            workflow_options_from_settings,
+            workflow_settings_from_options,
         )
 
-        snapshot = settings_to_preset_options(
-            {
-                **load_settings(),
-                "execution.special_video_policy": "season",
-                "execution.special_folder_conflict": "merge",
-                "execution.batch_size": 7,
-                "execution.batch_delay_seconds": 2,
-                "execution.retry_times": 3,
-                "execution.retry_backoff_seconds": 9,
-                "naming.special_folder_suffix": "{source_season} {name}",
-            }
-        )
-        expected_options = {
+        preset_settings = {
+            **load_settings(),
+            "execution.special_video_policy": "season",
+            "execution.special_folder_conflict": "merge",
+            "execution.batch_size": 7,
+            "execution.batch_delay_seconds": 2,
+            "execution.retry_times": 3,
+            "execution.retry_backoff_seconds": 9,
+            "naming.special_folder_suffix": "{source_season} {name}",
+        }
+        naming_snapshot = naming_options_from_settings(preset_settings)
+        workflow_snapshot = workflow_options_from_settings(preset_settings)
+        expected_naming = {
             "special_video_policy": "season",
             "special_folder_conflict": "merge",
+            "special_folder_suffix": "{source_season} {name}",
+        }
+        expected_workflow = {
             "batch_size": 7,
             "batch_delay_seconds": 2,
             "retry_times": 3,
             "retry_backoff_seconds": 9,
-            "special_folder_suffix": "{source_season} {name}",
         }
         check(
-            "预设快照：执行 / 撞名参数已纳入",
-            all(snapshot.get(key) == value for key, value in expected_options.items()),
-            str({key: snapshot.get(key) for key in expected_options}),
+            "命名预设快照：落点与撞名参数已纳入",
+            all(naming_snapshot.get(key) == value for key, value in expected_naming.items()),
+            str({key: naming_snapshot.get(key) for key in expected_naming}),
         )
-        restored = setting_values_from_preset_options(snapshot)
         check(
-            "预设快照：切预设能还原执行参数",
-            all(restored.get(PRESET_OPTION_KEYS[key]) == value for key, value in expected_options.items()),
-            str({PRESET_OPTION_KEYS[key]: restored.get(PRESET_OPTION_KEYS[key]) for key in expected_options}),
+            "工作流预设快照：执行参数已纳入",
+            all(workflow_snapshot.get(key) == value for key, value in expected_workflow.items()),
+            str({key: workflow_snapshot.get(key) for key in expected_workflow}),
         )
-        legacy_values = setting_values_from_preset_options({"subtitle_mode": "keep"})
         check(
-            "预设快照：旧预设选项缺新字段时解析不报错、不凭空产生设置值",
-            not any(PRESET_OPTION_KEYS[key] in legacy_values for key in expected_options),
-            str(sorted(legacy_values)),
+            "两层预设互不串味：命名层没有批量参数，工作流层没有撞名参数",
+            "batch_size" not in naming_snapshot
+            and "special_folder_suffix" not in workflow_snapshot
+            and "special_folder_conflict" not in workflow_snapshot,
+            f"naming={sorted(naming_snapshot)} workflow={sorted(workflow_snapshot)}",
+        )
+        restored_naming = naming_settings_from_options(naming_snapshot)
+        restored_workflow = workflow_settings_from_options(workflow_snapshot)
+        check(
+            "命名预设：切预设能还原落点参数",
+            all(
+                restored_naming.get(NAMING_PRESET_OPTION_KEYS[key]) == value
+                for key, value in expected_naming.items()
+            ),
+            str(restored_naming),
+        )
+        check(
+            "工作流预设：切预设能还原执行参数",
+            all(
+                restored_workflow.get(WORKFLOW_PRESET_OPTION_KEYS[key]) == value
+                for key, value in expected_workflow.items()
+            ),
+            str(restored_workflow),
+        )
+        legacy_naming = naming_settings_from_options({"subtitle_mode": "keep"})
+        legacy_workflow = workflow_settings_from_options({})
+        check(
+            "两层预设：旧快照缺的项按默认补全，不会留空",
+            legacy_naming.get("naming.subtitle_mode") == "keep"
+            and all(
+                key in legacy_naming for key in NAMING_PRESET_OPTION_KEYS.values()
+            )
+            and all(
+                key in legacy_workflow for key in WORKFLOW_PRESET_OPTION_KEYS.values()
+            ),
+            str(sorted(legacy_naming) + sorted(legacy_workflow)),
+        )
+
+        all_spec_keys = {spec.key for spec in SETTING_SPECS}
+        layer_keys = set(NAMING_PRESET_OPTION_KEYS.values()) | set(
+            WORKFLOW_PRESET_OPTION_KEYS.values()
+        )
+        check(
+            "两层预设：除密钥、本机开关和全局语言外，设置页的项全部进入快照",
+            layer_keys | set(PRESET_EXCLUDED_KEYS) == all_spec_keys,
+            f"缺 {sorted(all_spec_keys - layer_keys - set(PRESET_EXCLUDED_KEYS))}",
+        )
+        check(
+            "两层预设：三个密钥、网盘模式、全局语言都不写入预设",
+            all(
+                key in PRESET_EXCLUDED_KEYS
+                for key in (
+                    "providers.tmdb_api_key",
+                    "providers.bangumi_token",
+                    "providers.ai_api_key",
+                    "execution.network_drive_mode",
+                    "providers.tmdb_lang",
+                    "metadata.name_language_order",
+                )
+            )
+            and not (set(PRESET_EXCLUDED_KEYS) & layer_keys),
+            str(sorted(set(PRESET_EXCLUDED_KEYS) & layer_keys)),
+        )
+
+        # ---------------- 3d3. v7 迁移：旧单层预设拆成命名预设 + 工作流预设 ----------------
+        import app.store as store_module  # noqa: E402
+
+        preset_file = store_module.PRESETS_FILE
+        original_preset_text = preset_file.read_text("utf-8") if preset_file.exists() else None
+        try:
+            legacy_doc = {
+                "version": 6,
+                "default_id": "preset-old",
+                "presets": [
+                    {
+                        "id": "preset-old",
+                        "name": "旧预设",
+                        "is_default": True,
+                        "library_profile": "generic",
+                        "templates": {
+                            "episode": {
+                                "pattern": "{series} 自定义 {episode:02}",
+                                "output_mode": "filename",
+                            }
+                        },
+                        "options": {
+                            "subtitle_mode": "keep",
+                            "preserve_structure": True,
+                            "movie_layout": "special",
+                            "batch_size": 5,
+                            "tmdb_lang": "ja-JP",
+                            "无法归类的旧项": 1,
+                        },
+                    }
+                ],
+            }
+            preset_file.write_text(
+                json.dumps(legacy_doc, ensure_ascii=False), encoding="utf-8"
+            )
+            migrated = store_module._ensure_presets()
+            naming = (migrated.get("naming_presets") or [])[0]
+            workflow = (migrated.get("workflow_presets") or [])[0]
+            record = migrated.get("migration") or {}
+            check(
+                "v7 迁移：一份旧预设拆成一条命名预设 + 一条工作流预设",
+                len(migrated.get("naming_presets") or []) == 1
+                and len(migrated.get("workflow_presets") or []) == 1
+                and naming["id"] == "preset-old"
+                and workflow["id"] == "preset-old"
+                and workflow["naming_preset_id"] == "preset-old",
+                str(migrated.keys()),
+            )
+            check(
+                "v7 迁移：命名层完整接到原有值",
+                naming["options"].get("subtitle_mode") == "keep"
+                and naming["options"].get("preserve_structure") is True
+                and naming["options"].get("movie_layout") == "special"
+                and naming["templates"]["episode"]["pattern"] == "{series} 自定义 {episode:02}",
+                str(naming["options"]),
+            )
+            check(
+                "v7 迁移：工作流层完整接到原有值，且不夹带命名项",
+                workflow["options"].get("batch_size") == 5
+                and "subtitle_mode" not in workflow["options"]
+                and "preserve_structure" not in workflow["options"],
+                str(sorted(workflow["options"])),
+            )
+            check(
+                "v7 迁移：旧值缺的项按默认补齐并逐条记录",
+                naming["options"].get("default_season") == 1
+                and workflow["options"].get("retry_times") == 0
+                and any(
+                    item.get("layer") == "naming"
+                    and item.get("key") == "max_filename_bytes"
+                    for item in record.get("filled_defaults") or []
+                )
+                and any(
+                    item.get("layer") == "workflow"
+                    and item.get("key") == "retry_times"
+                    for item in record.get("filled_defaults") or []
+                ),
+                str(len(record.get("filled_defaults") or [])),
+            )
+            check(
+                "v7 迁移：全局语言项不搬进预设，差异单独记录",
+                "tmdb_lang" not in naming["options"]
+                and "tmdb_lang" not in workflow["options"]
+                and any(
+                    item.get("key") == "providers.tmdb_lang"
+                    and item.get("preset_value") == "ja-JP"
+                    for item in record.get("global_only_ignored") or []
+                )
+                and load_settings().get("providers.tmdb_lang") != "ja-JP",
+                str(record.get("global_only_ignored")),
+            )
+            check(
+                "v7 迁移：无法归类的旧键丢弃但留痕，不瞎猜",
+                any(
+                    item.get("key") == "无法归类的旧项"
+                    for item in record.get("dropped_keys") or []
+                ),
+                str(record.get("dropped_keys")),
+            )
+            check(
+                "v7 迁移：两层各自标记默认预设",
+                naming["is_default"] is True and workflow["is_default"] is True,
+                f"{naming['is_default']}/{workflow['is_default']}",
+            )
+        finally:
+            if original_preset_text is None:
+                preset_file.unlink(missing_ok=True)
+            else:
+                preset_file.write_text(original_preset_text, encoding="utf-8")
+
+        # 回归脚本不依赖 FastAPI，这里直接检查路由源码：旧接口必须 410 且给出新地址。
+        from app.config import LEGACY_PRESET_NOTICE  # noqa: E402
+
+        routes_source = (backend / "app/api/routes_presets.py").read_text("utf-8")
+        check(
+            "旧预设接口：不再静默返回旧数据，明确报 410 并说明新地址",
+            "status_code=410" in routes_source
+            and "LEGACY_PRESET_NOTICE" in routes_source
+            and "/api/naming-presets" in LEGACY_PRESET_NOTICE
+            and "/api/workflow-presets" in LEGACY_PRESET_NOTICE,
+            LEGACY_PRESET_NOTICE[:40],
+        )
+
+        run_naming = ensure_run("reg-naming-preset-run", naming_preset_id="preset-old")
+        run_naming_row = get_run(run_naming["id"]) or {}
+        check(
+            "运行记录：本次运行记下使用的命名预设",
+            (run_naming_row.get("snapshot") or {}).get("naming_preset_id") == "preset-old",
+            str(run_naming_row.get("snapshot")),
+        )
+        frozen_run = ensure_run("reg-naming-freeze", naming_preset_id="preset-old")
+        update_run(frozen_run["id"], stage="execute")
+        ensure_run("reg-naming-freeze", naming_preset_id="preset-other")
+        frozen_row = get_run(frozen_run["id"]) or {}
+        check(
+            "运行记录：进入执行阶段后不再被中途换预设改写",
+            (frozen_row.get("snapshot") or {}).get("naming_preset_id") == "preset-old",
+            str(frozen_row.get("snapshot")),
         )
 
         # ---------------- 3e. 多季同名素材文件夹：加季号 / 合并 / 自定义格式 ----------------
@@ -2898,6 +3135,692 @@ def main() -> int:
             "预览提示：识别到版本但模板没用 {version}",
             "版本" in " ".join(version_item["messages"]),
             str(version_item["messages"]),
+        )
+
+        # ---------------- 12. 第一批能力：运行记录 / 待人工清单 / 决策来源 ----------------
+        run = ensure_run("reg-run-stage", [{"id": "g1", "name": "回归组"}])
+        update_run(run["id"], stage="preview", snapshot_patch={"scan": {"file_count": 7}})
+        update_run(run["id"], stage="scan")
+        run_back = get_run(run["id"]) or {}
+        check(
+            "运行记录：阶段能存能读且只前进不后退",
+            run_back.get("stage") == "preview",
+            f"写回更早阶段后是 {run_back.get('stage')}",
+        )
+        update_run(run["id"], stage="execute", snapshot_patch={"preview": {"ok": 3}})
+        run_snapshot = (get_run(run["id"]) or {}).get("snapshot") or {}
+        check(
+            "运行记录：各阶段快照能写能读回",
+            (run_snapshot.get("scan") or {}).get("file_count") == 7
+            and (run_snapshot.get("preview") or {}).get("ok") == 3,
+            str(run_snapshot),
+        )
+        first_claim = claim_run(run["id"], "推进者A")
+        second_claim = claim_run(run["id"], "推进者B")
+        check(
+            "运行记录：占住后第二个推进者拿不到租约",
+            first_claim and not second_claim,
+            f"第一个={first_claim}，第二个={second_claim}",
+        )
+        release_run(run["id"], "推进者A")
+        released_claim = claim_run(run["id"], "推进者B")
+        check("运行记录：释放后别人能拿到租约", released_claim, str(released_claim))
+        # 模拟容器重启：启动时会把所有遗留租约清空
+        clear_run_locks()
+        lock_after_restart = (get_run(run["id"]) or {}).get("lock_owner", "")
+        check(
+            "运行记录：模拟重启后遗留租约被清空",
+            lock_after_restart == "",
+            f"租约持有者={lock_after_restart!r}",
+        )
+
+        pending_scan = {
+            "scan_id": "reg-pending",
+            "files": [
+                {
+                    "id": "p-unassigned",
+                    "category": "video",
+                    "filename": "未知.mkv",
+                    "path": "/tmp/未知.mkv",
+                    "rel_path": "未知.mkv",
+                    "group_id": "g1",
+                    "kind": "episode",
+                    "season": 1,
+                    "identify": {
+                        "title": "",
+                        "segment": "",
+                        "reason": "文件名和目录名都没有足够信息",
+                    },
+                },
+                {
+                    "id": "p-season",
+                    "category": "video",
+                    "filename": "作品 - S01E01.mkv",
+                    "path": "/tmp/作品 - S01E01.mkv",
+                    "rel_path": "作品/作品 - S01E01.mkv",
+                    "group_id": "g1",
+                    "kind": "episode",
+                    "season": 1,
+                    "identify": {
+                        "work_id": "w-season",
+                        "title": "作品",
+                        "segment": "作品",
+                        "confidence": "high",
+                    },
+                    "fields": {"tmdb_id": "100", "series": "作品"},
+                },
+            ],
+            "ignored_dirs": [{"group_id": "g1", "path": "SPs", "reason": "special"}],
+            "season_state": {
+                "w-season": {
+                    "seasons": [{"season_number": 1}, {"season_number": 2}],
+                    "choice": None,
+                }
+            },
+            "groups": [{"id": "g1", "name": "回归组"}],
+        }
+        pending_operation = {
+            "id": "op-pending",
+            "status": "conflict",
+            "items": [
+                {
+                    "seq": 9,
+                    "status": "conflict",
+                    "original_path": "/tmp/a.mkv",
+                    "target_path": "/tmp/b.mkv",
+                    "message": "目标已存在，需要选择处理方式",
+                }
+            ],
+        }
+        pending_snapshot = {
+            "preview": {
+                "issues": [
+                    {
+                        "status": "warning",
+                        "ref_id": "preview-w",
+                        "title": "警告文件",
+                        "reason": "标题可能含字幕组名",
+                    },
+                    {
+                        "status": "error",
+                        "ref_id": "preview-e",
+                        "title": "错误文件",
+                        "reason": "多个文件映射到同一目标路径",
+                    },
+                ]
+            }
+        }
+        collected = collect_pending(pending_scan, pending_operation, pending_snapshot)
+        collected_kinds = {item["kind"] for item in collected}
+        check(
+            "待人工清单：五类问题都能生成条目",
+            {
+                "unassigned",
+                "season",
+                "special",
+                "conflict",
+                "preview_warning",
+                "preview_error",
+            }
+            <= collected_kinds,
+            str(sorted(collected_kinds)),
+        )
+        check(
+            "待人工清单：每条都有中文原因",
+            all(str(item.get("reason") or "").strip() for item in collected),
+            str([(item["kind"], item.get("reason")) for item in collected]),
+        )
+        blocking_map = {item["kind"]: bool(item["blocking"]) for item in collected}
+        check(
+            "待人工清单：是否阻塞下一步判断正确",
+            blocking_map
+            == {
+                "unassigned": False,
+                "season": True,
+                "special": False,
+                "conflict": True,
+                "preview_warning": False,
+                "preview_error": True,
+            },
+            str(blocking_map),
+        )
+        pending_run = ensure_run("reg-pending", pending_scan["groups"])
+        sync_pending_items(pending_run["id"], "reg-pending", collected)
+        pending_counts_first = pending_counts(pending_run["id"])
+        check(
+            "待人工清单：条数与阻塞计数一致",
+            pending_counts_first["open"] == len(collected)
+            and pending_counts_first["blocking"] == 3
+            and pending_counts_first["blocking"]
+            == sum(1 for item in collected if item["blocking"]),
+            str(pending_counts_first),
+        )
+        kept = [
+            item
+            for item in collected
+            if item["kind"] not in ("unassigned", "preview_warning")
+        ]
+        open_after_resolve = sync_pending_items(pending_run["id"], "reg-pending", kept)
+        pending_counts_second = pending_counts(pending_run["id"])
+        open_kinds = {item["kind"] for item in open_after_resolve}
+        check(
+            "待人工清单：问题解决后自动关闭并从清单消失",
+            pending_counts_second["open"] == 4
+            and pending_counts_second["resolved"] == 2
+            and "unassigned" not in open_kinds
+            and "preview_warning" not in open_kinds,
+            str(pending_counts_second),
+        )
+        kept_blocking = [item for item in kept if item["kind"] != "season"]
+        sync_pending_items(pending_run["id"], "reg-pending", kept_blocking)
+        pending_counts_third = pending_counts(pending_run["id"])
+        check(
+            "待人工清单：处理掉阻塞条目后阻塞计数减少",
+            pending_counts_third["open"] == 3 and pending_counts_third["blocking"] == 2,
+            str(pending_counts_third),
+        )
+        sync_pending_items(pending_run["id"], "reg-pending", kept_blocking)
+        resolved_kinds = {
+            row["kind"]
+            for row in list_pending_items(pending_run["id"], True)
+            if row["status"] == "resolved"
+        }
+        check(
+            "待人工清单：已处理条目不会被重新生成",
+            resolved_kinds == {"unassigned", "preview_warning", "season"}
+            and pending_counts(pending_run["id"])["open"] == 3,
+            str(sorted(resolved_kinds)),
+        )
+
+        human_decision = record_store_decision(
+            "reg-decisions", "assign", "d-human", "作品甲 (2020)", source="human"
+        )
+        rule_decision = record_store_decision(
+            "reg-decisions",
+            "season",
+            "d-rule",
+            "3",
+            source="rule",
+            rule_id="rule-42",
+        )
+        ai_decision = record_store_decision(
+            "reg-decisions", "conflict", "d-ai", "overwrite", source="ai"
+        )
+        decision_rows = {
+            item["ref_id"]: item for item in list_decisions("reg-decisions")
+        }
+        check(
+            "决策来源：人工确认写入来源与时间",
+            decision_rows.get("d-human", {}).get("source") == "human"
+            and bool(decision_rows.get("d-human", {}).get("created_at"))
+            and bool(human_decision.get("created_at")),
+            str(decision_rows.get("d-human")),
+        )
+        check(
+            "决策来源：规则自动带上规则 id",
+            decision_rows.get("d-rule", {}).get("source") == "rule"
+            and decision_rows.get("d-rule", {}).get("rule_id") == "rule-42",
+            str(decision_rows.get("d-rule")),
+        )
+        check(
+            "决策来源：AI 来源是预留占位",
+            decision_rows.get("d-ai", {}).get("source") == "ai"
+            and decision_rows.get("d-ai", {}).get("source_label") == "AI 决策（预留）"
+            and bool(ai_decision.get("created_at")),
+            str(decision_rows.get("d-ai")),
+        )
+        decision_operation_id = create_pending_operation(
+            "reg-decisions",
+            None,
+            "回归预设",
+            {"groups": []},
+            [
+                {
+                    "file_id": "d-human",
+                    "category": "episode",
+                    "original_path": "/tmp/h.mkv",
+                    "target_path": "/tmp/h2.mkv",
+                    "status": "planned",
+                },
+                {
+                    "file_id": "d-rule",
+                    "category": "episode",
+                    "original_path": "/tmp/r.mkv",
+                    "target_path": "/tmp/r2.mkv",
+                    "status": "planned",
+                },
+                {
+                    "file_id": "d-ai",
+                    "category": "episode",
+                    "original_path": "/tmp/a.mkv",
+                    "target_path": "/tmp/a2.mkv",
+                    "status": "planned",
+                },
+                {
+                    "file_id": "d-unknown",
+                    "category": "episode",
+                    "original_path": "/tmp/u.mkv",
+                    "target_path": "/tmp/u2.mkv",
+                    "status": "planned",
+                },
+            ],
+            status="queued",
+            batch_count=1,
+        )
+        decision_operation = get_operation(decision_operation_id) or {}
+        unknown_item = next(
+            (
+                item
+                for item in decision_operation.get("items") or []
+                if item.get("file_id") == "d-unknown"
+            ),
+            None,
+        )
+        check(
+            "决策来源：历史数据缺字段显示未知",
+            unknown_item is not None
+            and unknown_item.get("decision_source") == ""
+            and unknown_item.get("rule_id") == ""
+            and unknown_item.get("decided_at") == "",
+            str(
+                unknown_item
+                and {
+                    "decision_source": unknown_item.get("decision_source"),
+                    "rule_id": unknown_item.get("rule_id"),
+                    "decided_at": unknown_item.get("decided_at"),
+                }
+            ),
+        )
+        decision_summary = operation_decision_counts(decision_operation_id)
+        check(
+            "决策来源：汇总计数与实际条目一致",
+            decision_summary == {"human": 1, "rule": 1, "ai": 1, "unknown": 1},
+            str(decision_summary),
+        )
+
+        # ---------------- 13. 第二批能力：自动放行门槛 ----------------
+        gate_clean_scan = {
+            "scan_id": "reg-gate-clean",
+            "files": [
+                {
+                    "id": "g-ok",
+                    "category": "video",
+                    "filename": "完成 - S01E01.mkv",
+                    "path": "/tmp/完成 - S01E01.mkv",
+                    "rel_path": "完成/完成 - S01E01.mkv",
+                    "group_id": "g-ok",
+                    "kind": "episode",
+                    "season": 1,
+                    "episode": 1,
+                    "identify": {
+                        "work_id": "w-clean",
+                        "title": "完成",
+                        "segment": "完成",
+                        "confidence": "high",
+                    },
+                    "fields": {"tmdb_id": "200", "series": "完成"},
+                }
+            ],
+            "ignored_dirs": [],
+            "season_state": {},
+            "groups": [{"id": "g-ok", "name": "门槛组"}],
+        }
+        gate_clean_run = {
+            "id": "run-gate-clean",
+            "scan_id": "reg-gate-clean",
+            "snapshot": {"preview": {"summary": {"ok": 1}, "issues": []}},
+        }
+        gate_clean = evaluate_gate(gate_clean_scan, None, gate_clean_run)
+        check(
+            "自动放行门槛：四项全绿才通过",
+            gate_clean.get("passed") is True
+            and gate_clean.get("blocked") is False
+            and len(gate_clean.get("checks") or []) == 4
+            and all(item.get("passed") for item in gate_clean.get("checks") or []),
+            str(gate_clean),
+        )
+        check(
+            "自动放行门槛：检查时间、运行编号、扫描编号都写进快照",
+            bool(gate_clean.get("checked_at"))
+            and gate_clean.get("run_id") == "run-gate-clean"
+            and gate_clean.get("scan_id") == "reg-gate-clean",
+            f"{gate_clean.get('checked_at')} / {gate_clean.get('run_id')} / {gate_clean.get('scan_id')}",
+        )
+
+        gate_blocked = evaluate_gate(pending_scan, pending_operation, {
+            "id": "run-gate-blocked",
+            "scan_id": "reg-pending",
+            "snapshot": pending_snapshot,
+        })
+        blocked_ids = [item.get("id") for item in gate_blocked.get("failed") or []]
+        checks_by_id = {item["id"]: item for item in gate_blocked.get("checks") or []}
+        check(
+            "自动放行门槛：任意一项不满足就整体不放行",
+            gate_blocked.get("passed") is False
+            and gate_blocked.get("blocked") is True
+            and blocked_ids
+            == ["preview_clear", "conflict_clear", "unassigned_clear", "season_clear"],
+            str(gate_blocked.get("failed")),
+        )
+        check(
+            "自动放行门槛：不放行时写明原因和问题明细",
+            all(str(item.get("reason") or "").strip() for item in gate_blocked.get("checks") or [])
+            and "未通过" in str(gate_blocked.get("summary") or "")
+            and len(checks_by_id["preview_clear"]["issues"]) == 2
+            and checks_by_id["conflict_clear"]["issues"][0]["ref_id"] == "op-pending:9"
+            and checks_by_id["unassigned_clear"]["issues"][0]["ref_id"] == "p-unassigned"
+            and checks_by_id["season_clear"]["issues"][0]["ref_id"] == "w-season",
+            str(
+                {
+                    key: [item.get("ref_id") for item in value.get("issues") or []]
+                    for key, value in checks_by_id.items()
+                }
+            ),
+        )
+
+        gate_no_preview = evaluate_gate(
+            gate_clean_scan,
+            None,
+            {"id": "run-gate-nopreview", "scan_id": "reg-gate-clean", "snapshot": {}},
+        )
+        check(
+            "自动放行门槛：没生成预览不算通过",
+            gate_no_preview.get("passed") is False
+            and [item.get("id") for item in gate_no_preview.get("failed") or []]
+            == ["preview_clear"]
+            and "还没生成预览" in str(gate_no_preview.get("summary") or "")
+            + " ".join(str(item.get("reason") or "") for item in gate_no_preview.get("checks") or []),
+            str(gate_no_preview),
+        )
+
+        gate_partial = evaluate_gate(
+            gate_clean_scan,
+            None,
+            {
+                "id": "run-gate-partial",
+                "scan_id": "reg-gate-clean",
+                "snapshot": {
+                    "preview": {
+                        "issues": [
+                            {
+                                "status": "warning",
+                                "ref_id": "pv-partial",
+                                "title": "部分警告",
+                                "reason": "标题可能含字幕组名",
+                            }
+                        ]
+                    }
+                },
+            },
+        )
+        partial_passed = {
+            item["id"]: bool(item.get("passed"))
+            for item in gate_partial.get("checks") or []
+        }
+        check(
+            "自动放行门槛：只满足部分检查也不放行",
+            gate_partial.get("passed") is False
+            and [item.get("id") for item in gate_partial.get("failed") or []] == ["preview_clear"]
+            and partial_passed
+            == {
+                "preview_clear": False,
+                "conflict_clear": True,
+                "unassigned_clear": True,
+                "season_clear": True,
+            },
+            str(partial_passed),
+        )
+
+        gate_run = ensure_run("reg-gate-persist", gate_clean_scan["groups"])
+        update_run(
+            gate_run["id"],
+            snapshot_patch={"preview": gate_clean_run["snapshot"]["preview"]},
+        )
+        gate_run = get_run(gate_run["id"]) or gate_run
+        gate_for_run = evaluate_gate(gate_clean_scan, None, gate_run)
+        update_run(gate_run["id"], snapshot_patch={"gate": gate_for_run})
+        gate_saved = ((get_run(gate_run["id"]) or {}).get("snapshot") or {}).get("gate") or {}
+        check(
+            "自动放行门槛：结果快照存到本次运行并可按运行回查",
+            gate_saved.get("passed") is True
+            and gate_saved.get("run_id") == gate_run["id"]
+            and gate_saved.get("scan_id") == "reg-gate-persist"
+            and gate_saved.get("checked_at") == gate_for_run.get("checked_at"),
+            str(gate_saved),
+        )
+
+        # ---------------- 14. 第二批能力：每次自动执行的授权记录 ----------------
+        auto_settings_on = {"execution.auto_execute_enabled": True}
+        check(
+            "自动执行授权：默认关闭",
+            load_settings().get("execution.auto_execute_enabled") is False,
+            str(load_settings().get("execution.auto_execute_enabled")),
+        )
+        auto_auth = create_auto_authorization(
+            run_id=gate_run["id"],
+            scan_id="reg-gate-persist",
+            confirmed_by="小张",
+            risk_version=AUTO_EXECUTE_RISK_VERSION,
+            risk_text=AUTO_EXECUTE_RISK_TEXT,
+            gate_checked_at=str(gate_for_run.get("checked_at") or ""),
+        )
+        check(
+            "自动执行授权：确认人、时间、风险版本、运行编号单独留档",
+            auto_auth.get("confirmed_by") == "小张"
+            and auto_auth.get("run_id") == gate_run["id"]
+            and auto_auth.get("scan_id") == "reg-gate-persist"
+            and auto_auth.get("risk_version") == AUTO_EXECUTE_RISK_VERSION
+            and auto_auth.get("gate_checked_at") == gate_for_run.get("checked_at")
+            and bool(auto_auth.get("created_at"))
+            and auto_auth.get("status") == "granted",
+            str(auto_auth),
+        )
+        check(
+            "自动执行授权：风险文案写明无人看守可能改错、撤销未必能完全恢复",
+            "无人看守" in AUTO_EXECUTE_RISK_TEXT
+            and "改错文件" in AUTO_EXECUTE_RISK_TEXT
+            and "撤销未必能完全恢复" in AUTO_EXECUTE_RISK_TEXT,
+            AUTO_EXECUTE_RISK_TEXT,
+        )
+        check(
+            "自动执行授权：没有授权记录就拒绝执行",
+            "没有找到本次运行的自动执行授权"
+            in auto_execute_refusal(auto_settings_on, gate_for_run, None, gate_run["id"]),
+            auto_execute_refusal(auto_settings_on, gate_for_run, None, gate_run["id"]),
+        )
+        check(
+            "自动执行授权：开关关闭时即使有授权也拒绝",
+            "开关未开启"
+            in auto_execute_refusal({}, gate_for_run, auto_auth, gate_run["id"]),
+            auto_execute_refusal({}, gate_for_run, auto_auth, gate_run["id"]),
+        )
+        check(
+            "自动执行授权：门槛不绿时即使有授权也拒绝",
+            "门槛未通过"
+            in auto_execute_refusal(auto_settings_on, gate_blocked, auto_auth, gate_run["id"]),
+            auto_execute_refusal(auto_settings_on, gate_blocked, auto_auth, gate_run["id"]),
+        )
+        check(
+            "自动执行授权：授权不能跨运行使用",
+            "不属于本次运行"
+            in auto_execute_refusal(auto_settings_on, gate_for_run, auto_auth, "run-other"),
+            auto_execute_refusal(auto_settings_on, gate_for_run, auto_auth, "run-other"),
+        )
+        stale_auth = create_auto_authorization(
+            run_id="run-gate-stale",
+            confirmed_by="小张",
+            risk_version="v0",
+            risk_text=AUTO_EXECUTE_RISK_TEXT,
+        )
+        check(
+            "自动执行授权：风险文案版本变化后旧授权失效",
+            "风险提示已更新"
+            in auto_execute_refusal(auto_settings_on, gate_for_run, stale_auth, "run-gate-stale"),
+            auto_execute_refusal(auto_settings_on, gate_for_run, stale_auth, "run-gate-stale"),
+        )
+        first_consume = consume_auto_authorization(auto_auth["id"])
+        second_consume = consume_auto_authorization(auto_auth["id"])
+        check(
+            "自动执行授权：一条授权只能放行一次",
+            first_consume
+            and not second_consume
+            and (get_auto_authorization(auto_auth["id"]) or {}).get("status") == "consumed"
+            and latest_granted_authorization(gate_run["id"]) is None,
+            f"第一次={first_consume}，第二次={second_consume}",
+        )
+        restore_auto_authorization(auto_auth["id"])
+        restored = get_auto_authorization(auto_auth["id"]) or {}
+        check(
+            "自动执行授权：执行没启动时授权可退回",
+            restored.get("status") == "granted"
+            and restored.get("consumed_at") == ""
+            and restored.get("risk_version") == AUTO_EXECUTE_RISK_VERSION,
+            str(restored),
+        )
+
+        # ---------------- 15. 第二批能力：继续接口与推进锁 ----------------
+        advance_order = [validate_advance(stage) for stage in ("scan", "match", "preview", "execute")]
+        check(
+            "推进运行：阶段只能按顺序前进一步",
+            advance_order == ["match", "preview", "execute", "done"],
+            str(advance_order),
+        )
+        done_error = ""
+        try:
+            validate_advance("done")
+        except AdvanceError as exc:
+            done_error = str(exc)
+        check(
+            "推进运行：已经完成的运行不能再推进",
+            "已经完成" in done_error,
+            done_error,
+        )
+        rule_error = ""
+        try:
+            validate_advance("scan", "rule", "")
+        except AdvanceError as exc:
+            rule_error = str(exc)
+        source_error = ""
+        try:
+            validate_advance("scan", "ai", "")
+        except AdvanceError as exc:
+            source_error = str(exc)
+        check(
+            "推进运行：规则自动必须带规则 id，来源只接受人工或规则",
+            "必须带上规则 id" in rule_error
+            and "来源只能是" in source_error
+            and validate_advance("scan", "rule", "auto-advance-1") == "match",
+            f"{rule_error} / {source_error}",
+        )
+        check(
+            "推进运行：执行未结束不能标记完成",
+            not can_mark_done("running")
+            and not can_mark_done("conflict")
+            and can_mark_done("done")
+            and can_mark_done("partial")
+            and can_mark_done("cancelled"),
+            "running/conflict 拒绝，done/partial/cancelled 允许",
+        )
+
+        events_run = ensure_run("reg-events", gate_clean_scan["groups"])
+        update_run(
+            events_run["id"],
+            stage="match",
+            event_source="rule",
+            event_rule_id="stage-rule-1",
+            actor="调度器",
+        )
+        events = list_run_events(events_run["id"])
+        stage_event = next((item for item in events if item.get("kind") == "stage"), None)
+        check(
+            "运行事件：阶段切换进事件流水并带来源与规则 id",
+            stage_event is not None
+            and "扫描 → 匹配作品" in str(stage_event.get("title") or "")
+            and stage_event.get("stage") == "match"
+            and stage_event.get("stage_label") == "匹配作品"
+            and stage_event.get("source") == "rule"
+            and stage_event.get("source_label") == "规则自动"
+            and stage_event.get("rule_id") == "stage-rule-1"
+            and stage_event.get("actor") == "调度器",
+            str(stage_event),
+        )
+        before_same = len(list_run_events(events_run["id"]))
+        update_run(events_run["id"], stage="match")
+        check(
+            "运行事件：阶段没变化时不重复写流水",
+            len(list_run_events(events_run["id"])) == before_same,
+            f"{before_same} -> {len(list_run_events(events_run['id']))}",
+        )
+
+        record_store_decision(
+            "reg-events",
+            "advance",
+            events_run["id"],
+            choice="preview",
+            source="human",
+            note="手动点一下",
+            run_id=events_run["id"],
+        )
+        record_store_decision(
+            "reg-events",
+            "advance",
+            events_run["id"],
+            choice="execute",
+            source="rule",
+            rule_id="auto-advance-1",
+            note="规则自动推进",
+            run_id=events_run["id"],
+        )
+        events = list_run_events(events_run["id"])
+        human_event = next(
+            (item for item in events if item.get("kind") == "human"), None
+        )
+        rule_event = next(
+            (
+                item
+                for item in events
+                if item.get("kind") == "rule" and item.get("rule_id") == "auto-advance-1"
+            ),
+            None,
+        )
+        check(
+            "运行事件：人工确认记为「人工确认」",
+            human_event is not None
+            and human_event.get("source_label") == "人工确认"
+            and "推进运行" in str(human_event.get("title") or "")
+            and human_event.get("detail", {}).get("choice") == "preview",
+            str(human_event),
+        )
+        check(
+            "运行事件：规则自动记为「规则自动」并带规则 id",
+            rule_event is not None
+            and rule_event.get("source_label") == "规则自动"
+            and rule_event.get("rule_id") == "auto-advance-1"
+            and rule_event.get("detail", {}).get("choice") == "execute",
+            str(rule_event),
+        )
+        event_ids = [int(item.get("id") or 0) for item in events]
+        event_titles = [str(item.get("title") or "") for item in events]
+        check(
+            "运行事件：按发生顺序可完整还原",
+            len(events) >= 3
+            and event_ids == sorted(event_ids)
+            and event_ids[0] > 0
+            and any("阶段：" in title for title in event_titles)
+            and any("推进运行" in title for title in event_titles),
+            str(event_titles),
+        )
+
+        lock_run = ensure_run("reg-lock", gate_clean_scan["groups"])
+        first_claim = claim_run(lock_run["id"], "owner-a", ttl_seconds=60)
+        second_claim = claim_run(lock_run["id"], "owner-b", ttl_seconds=60)
+        release_run(lock_run["id"], "owner-a")
+        third_claim = claim_run(lock_run["id"], "owner-b", ttl_seconds=60)
+        release_run(lock_run["id"], "owner-b")
+        check(
+            "推进锁：同一运行同时只允许一个推进者",
+            first_claim and not second_claim and third_claim,
+            f"a={first_claim}, b={second_claim}, 释放后 b={third_claim}",
         )
 
         passed = sum(1 for _, ok, _ in CHECKS if ok)

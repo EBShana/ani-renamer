@@ -25,11 +25,14 @@ from ..store import (
     operation_done_items,
     operation_item_counts,
     pending_operation_items,
+    release_run,
+    run_for_scan,
     set_operation_status,
     list_operations,
     update_operation_item_progress,
     update_operation_progress,
     update_operation_summary,
+    update_run,
 )
 from .executor import DirIndex, build_group_map, cleanup_done_sources, execute_item, find_existing
 from .lexicon import special_dir_name_set
@@ -333,6 +336,60 @@ def refresh_interrupted_summaries() -> None:
             pass
 
 
+def _release_run(operation_id: str, status: str) -> None:
+    """执行线程退出时释放运行租约，并把当前阶段快照写回去。"""
+    operation = get_operation(operation_id) or {}
+    scan_id = str(operation.get("scan_id") or "")
+    run = run_for_scan(scan_id) if scan_id else None
+    if run is None:
+        return
+    update_run(
+        run["id"],
+        snapshot_patch={
+            "execute": {
+                "operation_id": operation_id,
+                "status": status,
+            }
+        },
+    )
+    release_run(run["id"], operation_id)
+
+
+def _track_run(
+    operation_id: str,
+    status: str,
+    scan: dict | None,
+    operation: dict | None,
+    counts: dict[str, int] | None = None,
+) -> None:
+    """执行结束：完成才进“完成”，有冲突 / 失败就停在执行阶段等人处理。"""
+    operation = operation or get_operation(operation_id) or {}
+    scan_id = str(operation.get("scan_id") or "")
+    run = run_for_scan(scan_id) if scan_id else None
+    if run is None:
+        return
+    update_run(
+        run["id"],
+        stage="done" if status == "done" else "execute",
+        snapshot_patch={
+            "execute": {
+                "operation_id": operation_id,
+                "status": status,
+                "counts": counts or {},
+            }
+        },
+    )
+    release_run(run["id"], operation_id)
+    if scan is not None:
+        try:
+            from .pending import sync_for_scan
+
+            sync_for_scan(scan, operation)
+        except Exception:
+            # 待人工清单刷新失败不影响执行结果
+            pass
+
+
 class OperationManager:
     """单例后台任务管理器（单进程 Uvicorn）。"""
 
@@ -399,6 +456,7 @@ class OperationManager:
         if scan is not None:
             light_recheck(scan, operation or {})
             save_scan(scan)
+        _release_run(operation_id, "cancelled")
 
     def _finish(self, operation_id: str, policy: str, groups: list[dict], keep_empty_dirs: bool) -> None:
         low_io = bool(load_settings().get("execution.network_drive_mode"))
@@ -422,13 +480,13 @@ class OperationManager:
         # 第 5 步：成功的条目移出预览清单，失败 / 跳过 / 冲突的留在原处并带上原因
         operation = get_operation(operation_id)
         scan_id = str((operation or {}).get("scan_id") or "")
-        if scan_id:
-            scan = get_scan(scan_id)
-            if scan is not None:
-                apply_operation_result(scan, operation or {})
-                if self._needs_light_check(operation, status, counts):
-                    light_recheck(scan, operation or {})
-                save_scan(scan)
+        scan = get_scan(scan_id) if scan_id else None
+        if scan is not None:
+            apply_operation_result(scan, operation or {})
+            if self._needs_light_check(operation, status, counts):
+                light_recheck(scan, operation or {})
+            save_scan(scan)
+        _track_run(operation_id, status, scan, operation, counts)
 
     def _run(self, operation_id: str, policy: str, keep_empty_dirs: bool) -> None:
         operation = get_operation(operation_id)
@@ -455,6 +513,7 @@ class OperationManager:
                 if self._pause.is_set():
                     set_operation_status(operation_id, "paused")
                     refresh_summary(operation_id)
+                    _release_run(operation_id, "paused")
                     return
                 batch = pending_operation_items(operation_id)[:batch_size]
                 if not batch:
@@ -491,6 +550,7 @@ class OperationManager:
                     if self._pause.is_set():
                         set_operation_status(operation_id, "paused")
                         refresh_summary(operation_id)
+                        _release_run(operation_id, "paused")
                         return
                 # 批与批之间等待：网盘场景可减少同时进行的请求量
                 if batch_delay > 0 and pending_operation_items(operation_id):
@@ -503,6 +563,7 @@ class OperationManager:
             finally:
                 set_operation_status(operation_id, "interrupted")
                 refresh_summary(operation_id)
+                _release_run(operation_id, "interrupted")
         finally:
             try:
                 write_conn.close()

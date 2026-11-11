@@ -6,6 +6,7 @@ from pydantic import BaseModel
 from ..config import get_media_root, load_settings
 from ..core.identify import apply_identification, apply_special_memory
 from ..core.pattern_cache import auto_apply_scan
+from ..core.pending import sync_for_scan
 from ..core.preview import load_preset
 from ..core.queue import init_queue, overview
 from ..core.rescan import light_recheck
@@ -19,15 +20,40 @@ from ..core.scan_store import (
 )
 from ..core.scanner import ScanError, scan_groups
 from ..store import (
+    ensure_run,
     get_group,
     latest_operation_for_scan,
     list_aliases,
     list_assignments,
     list_rules,
     list_special_memory,
+    update_run,
 )
 
 router = APIRouter()
+
+
+def _track_scan(result: dict) -> None:
+    """扫描完成即建立本次运行，记下扫描阶段快照，并刷新待人工清单。"""
+    scan_id = str(result.get("scan_id") or "")
+    if not scan_id:
+        return
+    run = ensure_run(scan_id, result.get("groups") or [])
+    update_run(
+        run["id"],
+        stage="scan",
+        snapshot_patch={
+            "scan": {
+                "file_count": len(result.get("files") or []),
+                "groups": [
+                    str(item.get("name") or item.get("id") or "")
+                    for item in result.get("groups") or []
+                    if isinstance(item, dict)
+                ],
+            }
+        },
+    )
+    sync_for_scan(result)
 
 
 class ScanRequest(BaseModel):
@@ -61,6 +87,7 @@ def create_scan(payload: ScanRequest) -> dict:
     auto_apply_scan(result, load_preset(None), settings)
     init_queue(result)
     put_scan(result)
+    _track_scan(result)
     return result
 
 
@@ -140,6 +167,7 @@ def rescan_scan(scan_id: str, payload: RescanRequest) -> dict:
     auto_apply_scan(result, load_preset(None), settings)
     init_queue(result)
     put_scan(result)
+    _track_scan(result)
     return result
 
 
@@ -149,4 +177,5 @@ def samples() -> dict:
     # 示例也要放进扫描会话，未归属区、清单和预览才能读取
     init_queue(result)
     put_scan(result)
+    _track_scan(result)
     return result

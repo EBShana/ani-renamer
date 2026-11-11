@@ -128,7 +128,8 @@ export interface TemplateSpec {
   legacy_dir?: string;
 }
 
-export interface PresetOptions {
+/** 命名预设：3 条模板 + 13 个命名/落点选项。 */
+export interface NamingPresetOptions {
   subtitle_mode: "follow" | "keep";
   auto_append_ext: boolean;
   max_filename_bytes: number;
@@ -136,35 +137,75 @@ export interface PresetOptions {
   specials_dir: string;
   preserve_structure: boolean;
   movie_layout: "folder" | "special";
-  tmdb_lang: string;
-  scan_all_files: boolean;
-  ignore_special_dirs: boolean;
-  ova_policy: "move" | "ignore";
-  special_dir_names: string;
-  write_ignore_markers: boolean;
+  special_folder_suffix: string;
   default_season: number;
   special_season_zero: boolean;
+  ova_policy: "move" | "ignore";
+  special_video_policy: "root" | "season";
+  special_folder_conflict: "season" | "merge";
+}
+
+/** 工作流预设：其余识别与扫描、AI/提供方、执行、刮削选项。 */
+export interface WorkflowPresetOptions {
+  proxy_url: string;
+  ai_enabled: boolean;
+  ai_base_url: string;
+  ai_model: string;
+  ai_batch_limit: number;
+  ai_special_enabled: boolean;
+  ai_pattern_cache_auto_apply: boolean;
+  scan_all_files: boolean;
+  ignore_special_dirs: boolean;
+  special_dir_names: string;
+  ignore_marker_files: string;
+  write_ignore_markers: boolean;
+  generic_dir_names: string;
+  min_title_length: number;
+  max_files: number;
   conflict_policy: "skip" | "overwrite" | "suffix";
   keep_empty_dirs: boolean;
   asset_policy: "move" | "keep";
+  batch_size: number;
+  batch_delay_seconds: number;
+  retry_times: number;
+  retry_backoff_seconds: number;
+  scraper_enabled: boolean;
 }
 
-export interface Preset {
+export interface NamingPreset {
   id: string;
   name: string;
   is_default: boolean;
   library_profile: string;
   templates: Record<Kind, TemplateSpec>;
-  options: PresetOptions;
+  options: NamingPresetOptions;
   created_at?: string;
   updated_at?: string;
 }
 
-export interface PresetInput {
+export interface WorkflowPreset {
+  id: string;
+  name: string;
+  is_default: boolean;
+  library_profile: string;
+  naming_preset_id: string;
+  options: WorkflowPresetOptions;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface NamingPresetInput {
   name: string;
   library_profile: string;
   templates: Record<Kind, TemplateSpec>;
-  options?: PresetOptions;
+  options?: NamingPresetOptions;
+}
+
+export interface WorkflowPresetInput {
+  name: string;
+  library_profile: string;
+  naming_preset_id?: string;
+  options?: WorkflowPresetOptions;
 }
 
 export type QueueStage = "scan" | "match" | "preview" | "done";
@@ -265,6 +306,9 @@ export interface ExecuteRow {
   status: "done" | "skipped" | "failed" | "conflict" | "planned" | "merged";
   message: string;
   choice?: string;
+  decision_source?: string;
+  rule_id?: string;
+  decided_at?: string;
 }
 
 export interface ExecuteRisk {
@@ -393,6 +437,117 @@ export interface OperationRecord {
   undone_at: string | null;
   item_count?: number;
   items?: ExecuteRow[];
+  decision_counts?: { human: number; rule: number; ai: number; unknown: number };
+}
+
+export type RunStage = "scan" | "match" | "preview" | "execute" | "done";
+
+export interface RunRecord {
+  id: string;
+  scan_id: string;
+  stage: RunStage;
+  stage_label: string;
+  status: string;
+  preset_id: string | null;
+  operation_id: string | null;
+  groups: DirectoryGroup[];
+  snapshot: Record<string, unknown>;
+  lock_owner: string;
+  lock_expires_at: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PendingCounts {
+  open: number;
+  resolved: number;
+  blocking: number;
+  total?: number;
+}
+
+export interface PendingItem {
+  id: string;
+  run_id: string;
+  scan_id: string;
+  kind: string;
+  kind_label: string;
+  ref_type: string;
+  ref_id: string;
+  title: string;
+  reason: string;
+  blocking: boolean;
+  status: "open" | "resolved";
+  resolved_by: string;
+  resolved_at: string;
+  decision_source: string;
+  decision_source_label: string;
+  meta: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RunStatus {
+  run: RunRecord | null;
+  pending: PendingCounts;
+  locked?: boolean;
+}
+
+export interface GateIssue {
+  kind: string;
+  kind_label: string;
+  ref_type: string;
+  ref_id: string;
+  title: string;
+  reason: string;
+  blocking: boolean;
+}
+
+export interface GateCheck {
+  id: string;
+  label: string;
+  passed: boolean;
+  reason: string;
+  issues: GateIssue[];
+}
+
+export interface GateResult {
+  checked_at: string;
+  run_id: string;
+  scan_id: string;
+  passed: boolean;
+  blocked: boolean;
+  summary: string;
+  failed: { id: string; label: string }[];
+  checks: GateCheck[];
+}
+
+export interface AutoAuthorization {
+  id: string;
+  run_id: string;
+  scan_id: string;
+  operation_id: string;
+  confirmed_by: string;
+  risk_version: string;
+  risk_text: string;
+  gate_checked_at: string;
+  status: "granted" | "consumed" | string;
+  created_at: string;
+  consumed_at: string;
+}
+
+export interface AutoExecuteState {
+  run: RunRecord;
+  enabled: boolean;
+  gate: GateResult | null;
+  risk: { version: string; text: string };
+  authorizations: AutoAuthorization[];
+  latest_granted: AutoAuthorization | null;
+}
+
+export interface PendingResponse {
+  run: RunRecord | null;
+  items: PendingItem[];
+  counts: PendingCounts;
 }
 
 export interface UndoResponse {

@@ -7,6 +7,7 @@ import type {
   AiSpecialResponse,
   AiStatus,
   AliasRecord,
+  AutoExecuteState,
   AutoMatchResponse,
   BrowseResult,
   ConfigSchema,
@@ -15,6 +16,7 @@ import type {
   DirectoryGroup,
   ExecuteResponse,
   FieldPayload,
+  GateResult,
   GroupCheck,
   IdentifyOverview,
   Kind,
@@ -31,10 +33,13 @@ import type {
   PatternDecisionValue,
   PatternProposeResult,
   PatternStructure,
-  Preset,
-  PresetInput,
+  PendingResponse,
+  NamingPreset,
+  NamingPresetInput,
   PresetSettingsDiff,
   PreviewResponse,
+  WorkflowPreset,
+  WorkflowPresetInput,
   ProviderTestResult,
   QueueStage,
   QueueView,
@@ -42,6 +47,7 @@ import type {
   ResolveResponse,
   ResumeResponse,
   RuleInfo,
+  RunStatus,
   ScanPayload,
   ScanRecord,
   SeasonPlanResponse,
@@ -398,36 +404,74 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
-  presets: () => request<{ presets: Preset[] }>("/presets"),
+  namingPresets: () => request<{ presets: NamingPreset[] }>("/naming-presets"),
 
-  createPreset: (payload: PresetInput) =>
-    request<Preset>("/presets", { method: "POST", body: JSON.stringify(payload) }),
+  createNamingPreset: (payload: NamingPresetInput) =>
+    request<NamingPreset>("/naming-presets", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
 
-  updatePreset: (id: string, payload: PresetInput) =>
-    request<Preset>(`/presets/${id}`, { method: "PUT", body: JSON.stringify(payload) }),
+  updateNamingPreset: (id: string, payload: NamingPresetInput) =>
+    request<NamingPreset>(`/naming-presets/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
 
-  deletePreset: (id: string) =>
-    request<{ ok: boolean }>(`/presets/${id}`, { method: "DELETE" }),
+  deleteNamingPreset: (id: string) =>
+    request<{ ok: boolean }>(`/naming-presets/${id}`, { method: "DELETE" }),
 
-  duplicatePreset: (id: string) =>
-    request<Preset>(`/presets/${id}/duplicate`, { method: "POST" }),
+  duplicateNamingPreset: (id: string) =>
+    request<NamingPreset>(`/naming-presets/${id}/duplicate`, { method: "POST" }),
 
-  setDefaultPreset: (id: string) =>
-    request<Preset>(`/presets/${id}/default`, { method: "POST" }),
+  setDefaultNamingPreset: (id: string) =>
+    request<NamingPreset>(`/naming-presets/${id}/default`, { method: "POST" }),
 
-  presetSettingsDiff: (id: string) =>
-    request<PresetSettingsDiff>(`/presets/${id}/settings-diff`),
+  namingPresetSettingsDiff: (id: string) =>
+    request<PresetSettingsDiff>(`/naming-presets/${id}/settings-diff`),
 
-  applyPresetSettings: (id: string) =>
+  applyNamingPresetSettings: (id: string) =>
     request<{ preset_id: string; values: Record<string, unknown> }>(
-      `/presets/${id}/apply-settings`,
+      `/naming-presets/${id}/apply-settings`,
+      { method: "POST" },
+    ),
+
+  workflowPresets: () => request<{ presets: WorkflowPreset[] }>("/workflow-presets"),
+
+  createWorkflowPreset: (payload: WorkflowPresetInput) =>
+    request<WorkflowPreset>("/workflow-presets", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  updateWorkflowPreset: (id: string, payload: WorkflowPresetInput) =>
+    request<WorkflowPreset>(`/workflow-presets/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(payload),
+    }),
+
+  deleteWorkflowPreset: (id: string) =>
+    request<{ ok: boolean }>(`/workflow-presets/${id}`, { method: "DELETE" }),
+
+  duplicateWorkflowPreset: (id: string) =>
+    request<WorkflowPreset>(`/workflow-presets/${id}/duplicate`, { method: "POST" }),
+
+  setDefaultWorkflowPreset: (id: string) =>
+    request<WorkflowPreset>(`/workflow-presets/${id}/default`, { method: "POST" }),
+
+  workflowPresetSettingsDiff: (id: string) =>
+    request<PresetSettingsDiff>(`/workflow-presets/${id}/settings-diff`),
+
+  applyWorkflowPresetSettings: (id: string) =>
+    request<{ preset_id: string; values: Record<string, unknown> }>(
+      `/workflow-presets/${id}/apply-settings`,
       { method: "POST" },
     ),
 
   exportPresets: () => request<Record<string, unknown>>("/presets/export"),
 
   importPresets: (payload: Record<string, unknown>) =>
-    request<{ created: number; presets: Preset[] }>("/presets/import", {
+    request<{ created: number; presets: unknown[] }>("/presets/import", {
       method: "POST",
       body: JSON.stringify(payload),
     }),
@@ -443,7 +487,7 @@ export const api = {
 
   preview: (payload: {
     scan_id?: string;
-    preset_id?: string;
+    naming_preset_id?: string;
     templates?: Partial<Record<Kind, TemplateSpec>>;
     file_ids?: string[];
     folder_ids?: string[];
@@ -453,7 +497,7 @@ export const api = {
 
   execute: (payload: {
     scan_id?: string;
-    preset_id?: string;
+    naming_preset_id?: string;
     templates?: Partial<Record<Kind, TemplateSpec>>;
     file_ids?: string[];
     folder_ids?: string[];
@@ -469,6 +513,61 @@ export const api = {
     request<{ operations: OperationRecord[]; active_operation_id?: string | null }>(
       `/history?limit=${limit}`,
     ),
+
+  currentRun: () => request<RunStatus>("/runs/current"),
+
+  gateCheck: (runId: string) =>
+    request<{ run: RunStatus["run"]; gate: GateResult }>(`/runs/${runId}/gate/check`, {
+      method: "POST",
+    }),
+
+  autoExecuteState: (runId: string) =>
+    request<AutoExecuteState>(`/runs/${runId}/auto-execute`),
+
+  authorizeAutoExecute: (runId: string, confirmedBy: string) =>
+    request<{ run: RunStatus["run"]; gate: GateResult; authorization: AutoExecuteState["latest_granted"]; risk: AutoExecuteState["risk"] }>(
+      `/runs/${runId}/auto-execute/authorize`,
+      { method: "POST", body: JSON.stringify({ confirmed_by: confirmedBy }) },
+    ),
+
+  autoExecute: (
+    runId: string,
+    payload: {
+      authorization_id: string;
+      scan_id?: string;
+      naming_preset_id?: string;
+      templates?: Partial<Record<Kind, TemplateSpec>>;
+      file_ids?: string[];
+      folder_ids?: string[];
+      confirm_risks?: boolean;
+    },
+  ) =>
+    request<
+      ExecuteResponse & {
+        auto_execute?: {
+          authorization_id: string;
+          started: boolean;
+          authorization_consumed: boolean;
+          message?: string;
+        };
+      }
+    >(`/runs/${runId}/auto-execute`, { method: "POST", body: JSON.stringify(payload) }),
+
+  pending: (scanId?: string, includeResolved = false) =>
+    request<PendingResponse>(
+      `/pending?${scanId ? `scan_id=${encodeURIComponent(scanId)}&` : ""}include_resolved=${
+        includeResolved ? "true" : "false"
+      }`,
+    ),
+
+  syncPending: (scanId?: string) =>
+    request<PendingResponse>(
+      `/pending/sync?${scanId ? `scan_id=${encodeURIComponent(scanId)}` : ""}`,
+      { method: "POST" },
+    ),
+
+  historyDetail: (operationId: string) =>
+    request<OperationRecord>(`/history/${operationId}`),
 
   progress: (operationId: string) =>
     request<OperationProgress>(`/history/${operationId}/progress`),

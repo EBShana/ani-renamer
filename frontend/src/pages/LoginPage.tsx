@@ -38,7 +38,7 @@ export default function LoginPage({ onLoggedIn }: Props) {
         display: "flex",
         alignItems: "center",
         justifyContent: "center",
-        background: "#101828",
+        background: "var(--ani-bg)",
       }}
     >
       <Card style={{ width: 360 }}>

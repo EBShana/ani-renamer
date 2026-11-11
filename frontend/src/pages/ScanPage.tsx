@@ -35,16 +35,19 @@ import type {
   AiStatus,
   Category,
   DirectoryGroup,
+  NamingPreset,
   ParsedFile,
-  Preset,
   QueueEntry,
   QueueView,
   RescanCheck,
   ScanPayload,
   ScanRecord,
+  WorkflowPreset,
 } from "../types";
 import { CATEGORY_LABELS } from "../types";
 import ListFilterBar, { EMPTY_FILTER, entryMatches, type ListFilterValue } from "../listFilters";
+import PresetBar from "../components/PresetBar";
+import PageSections from "../components/SectionNav";
 
 const { Text, Title } = Typography;
 
@@ -72,9 +75,15 @@ interface Props {
   onScan: (payload: ScanPayload | null) => void;
   onNext: () => void;
   reloadQueue: () => Promise<void>;
-  presets: Preset[];
-  presetId: string | null;
-  onPresetChange: (presetId: string) => void;
+  workflowPresets: WorkflowPreset[];
+  workflowPresetId: string | null;
+  onWorkflowPresetChange: (presetId: string) => void;
+  namingPresets: NamingPreset[];
+  namingPresetId: string | null;
+  onNamingPresetChange: (presetId: string) => void;
+  reloadWorkflowPresets: (selectId?: string) => Promise<WorkflowPreset[]>;
+  settingsVersion: number;
+  onSettingsChanged: () => void;
 }
 
 function formatSize(bytes: number): string {
@@ -95,9 +104,15 @@ export default function ScanPage({
   onScan,
   onNext,
   reloadQueue,
-  presets,
-  presetId,
-  onPresetChange,
+  workflowPresets,
+  workflowPresetId,
+  onWorkflowPresetChange,
+  namingPresets,
+  namingPresetId,
+  onNamingPresetChange,
+  reloadWorkflowPresets,
+  settingsVersion,
+  onSettingsChanged,
 }: Props) {
   const [groups, setGroups] = useState<DirectoryGroup[]>([]);
   const [checked, setChecked] = useState<string[]>([]);
@@ -535,8 +550,35 @@ export default function ScanPage({
   };
 
   return (
-    <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card>
+    <PageSections
+      items={[
+        { id: "sec-preset", label: "工作流预设" },
+        { id: "sec-groups", label: "目录组与扫描" },
+        ...(scan ? [{ id: "sec-result", label: "扫描结果" }] : []),
+      ]}
+      primaryAction={{
+        label: "下一步",
+        hint: `${checked.length}/${queue?.counts.scan ?? 0}`,
+        disabled: checked.length === 0 || moving,
+        loading: moving,
+        onClick: () => void moveNext(),
+      }}
+    >
+      <Space direction="vertical" size={16} style={{ width: "100%" }}>
+        <div id="sec-preset" data-section>
+          <PresetBar
+            workflowPresets={workflowPresets}
+            workflowPresetId={workflowPresetId}
+            onWorkflowPresetChange={onWorkflowPresetChange}
+            namingPresets={namingPresets}
+            namingPresetId={namingPresetId}
+            onNamingPresetChange={onNamingPresetChange}
+            reloadWorkflowPresets={reloadWorkflowPresets}
+            settingsVersion={settingsVersion}
+            onSettingsChanged={onSettingsChanged}
+          />
+        </div>
+        <Card id="sec-groups" data-section>
         <Title level={5} style={{ marginTop: 0 }}>
           1. 选择目录组（源目录 → 目标目录）
         </Title>
@@ -643,23 +685,6 @@ export default function ScanPage({
           )}
         />
 
-        <Divider />
-        <Space wrap>
-          <Text type="secondary">工作流预设</Text>
-          <Select
-            style={{ minWidth: 220 }}
-            value={presetId ?? undefined}
-            onChange={(value) => onPresetChange(value)}
-            options={presets.map((item) => ({
-              value: item.id,
-              label: `${item.name}${item.is_default ? "（默认）" : ""}`,
-            }))}
-            placeholder="选择预设"
-          />
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            工作流设置（字幕、特典、冲突等）统一在「设置」页管理，预设只保存命名规则。
-          </Text>
-        </Space>
         <div>
           <Button
             type="primary"
@@ -682,7 +707,7 @@ export default function ScanPage({
       </Card>
 
       {scan && (
-        <Card>
+        <Card id="sec-result" data-section>
           {scan.restored && (
             <Alert
               type="warning"
@@ -817,14 +842,9 @@ export default function ScanPage({
             selectedCount={filteredChecked}
             totalCount={scanEntries.length}
             extra={
-              <Space>
-                <Text type="secondary">
-                  总已选 {checked.length} / 留在本页 {Math.max(0, (queue?.counts.scan ?? 0) - checked.length)}
-                </Text>
-                <Button type="primary" loading={moving} onClick={moveNext}>
-                  下一步：带出 {checked.length} 项 → 匹配作品
-                </Button>
-              </Space>
+              <Text type="secondary">
+                总已选 {checked.length} / 留在本页 {Math.max(0, (queue?.counts.scan ?? 0) - checked.length)}
+              </Text>
             }
           />
           {scanEntries.length === 0 ? (
@@ -1047,7 +1067,7 @@ export default function ScanPage({
                     display: "flex",
                     gap: 8,
                     padding: "8px 0",
-                    borderBottom: "1px solid #f0f0f0",
+                    borderBottom: "1px solid var(--ani-border)",
                   }}
                 >
                   <Checkbox
@@ -1136,6 +1156,7 @@ export default function ScanPage({
           )}
         />
       </Modal>
-    </Space>
+      </Space>
+    </PageSections>
   );
 }

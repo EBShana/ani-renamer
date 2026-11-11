@@ -46,6 +46,7 @@ class SettingSpec:
 SETTING_GROUPS: list[tuple[str, str]] = [
     ("parse", "识别"),
     ("naming", "命名"),
+    ("language", "语言（全局）"),
     ("providers", "元数据源与 AI"),
     ("execution", "执行"),
     ("scraper", "刮削（预留）"),
@@ -227,15 +228,15 @@ SETTING_SPECS: list[SettingSpec] = [
         "TMDB 语言",
         "string",
         "zh-CN",
-        "providers",
-        "例如 zh-CN / ja-JP / en-US",
+        "language",
+        "例如 zh-CN / ja-JP / en-US。全局生效，不随命名预设或工作流预设变化。",
     ),
     SettingSpec(
         "metadata.name_language_order",
         "作品名语言优先级",
         "select",
         "cn_tw_jp_en",
-        "providers",
+        "language",
         "TMDB 没有简体中文名时，按这个顺序找替代。"
         "判断标准：简体名称为空，或与原名相同（说明 TMDB 没有简体翻译）。"
         "作品名始终取自 TMDB 返回值，AI 不参与命名。",
@@ -434,6 +435,16 @@ SETTING_SPECS: list[SettingSpec] = [
         "关闭后恢复常规行为。结果、命名与撤销能力在两种模式下完全一致。",
     ),
     SettingSpec(
+        "execution.auto_execute_enabled",
+        "允许自动执行（每次仍需单独授权）",
+        "bool",
+        False,
+        "execution",
+        "默认关闭。打开后也只是一个前置开关：每次自动执行都必须另行生成一条本次运行的授权，"
+        "且预览零警告、零冲突、零未归属、季号全部确定四项门槛必须全绿。"
+        "找不到授权或门槛未通过都会拒绝执行，没有强制跳过。",
+    ),
+    SettingSpec(
         "scraper.enabled",
         "启用刮削（预留）",
         "bool",
@@ -484,9 +495,21 @@ def load_settings() -> dict[str, Any]:
     return values
 
 
-# 预设选项快照与全局设置的字段映射（预设选项 key -> 全局设置 key）。
-# 从 v2 起，预设不再在运行时覆盖设置；这张表只用于“保存预设快照”和“应用预设设置”。
-PRESET_OPTION_KEYS: dict[str, str] = {
+# ---------------------------------------------------------------------------
+# 两层预设
+#
+# 命名预设：3 条模板 + 13 个“命名与目录摆放”选项。
+#   8 项 naming.*：字幕、扩展名、文件名长度、禁用字符、特典季目录、保留原结构、
+#   剧场版落点、撞名素材文件夹命名。
+#   5 项跨边界：默认季号、特典归入第 0 季、OVA 处理方式、特典文件夹里的视频、
+#   多季同名素材文件夹——它们直接决定文件/目录落在哪，和模板一起编辑更顺手。
+#
+# 工作流预设：其余 23 项（识别与扫描、元数据源与 AI、执行、刮削）。
+#
+# providers.tmdb_lang 与 metadata.name_language_order 是全局语言设置，
+# 两层预设都不再保存，切换预设不会改变它们。
+# ---------------------------------------------------------------------------
+NAMING_PRESET_OPTION_KEYS: dict[str, str] = {
     "subtitle_mode": "naming.subtitle_mode",
     "auto_append_ext": "naming.auto_append_ext",
     "max_filename_bytes": "naming.max_filename_bytes",
@@ -494,55 +517,141 @@ PRESET_OPTION_KEYS: dict[str, str] = {
     "specials_dir": "naming.specials_dir",
     "preserve_structure": "naming.preserve_structure",
     "movie_layout": "naming.movie_layout",
-    "tmdb_lang": "providers.tmdb_lang",
-    "scan_all_files": "parse.scan_all_files",
-    "ignore_special_dirs": "parse.ignore_special_dirs",
-    "ova_policy": "parse.ova_policy",
-    "special_dir_names": "parse.special_dir_names",
-    "write_ignore_markers": "parse.write_ignore_markers",
+    "special_folder_suffix": "naming.special_folder_suffix",
     "default_season": "parse.default_season",
     "special_season_zero": "parse.special_season_zero",
-    "special_folder_suffix": "naming.special_folder_suffix",
+    "ova_policy": "parse.ova_policy",
+    "special_video_policy": "execution.special_video_policy",
+    "special_folder_conflict": "execution.special_folder_conflict",
+}
+
+WORKFLOW_PRESET_OPTION_KEYS: dict[str, str] = {
+    "proxy_url": "providers.proxy_url",
+    "ai_enabled": "providers.ai_enabled",
+    "ai_base_url": "providers.ai_base_url",
+    "ai_model": "providers.ai_model",
+    "ai_batch_limit": "providers.ai_batch_limit",
+    "ai_special_enabled": "providers.ai_special_enabled",
+    "ai_pattern_cache_auto_apply": "providers.ai_pattern_cache_auto_apply",
+    "scan_all_files": "parse.scan_all_files",
+    "ignore_special_dirs": "parse.ignore_special_dirs",
+    "special_dir_names": "parse.special_dir_names",
+    "ignore_marker_files": "parse.ignore_marker_files",
+    "write_ignore_markers": "parse.write_ignore_markers",
+    "generic_dir_names": "parse.generic_dir_names",
+    "min_title_length": "parse.min_title_length",
+    "max_files": "parse.max_files",
     "conflict_policy": "execution.conflict_policy",
     "keep_empty_dirs": "execution.keep_empty_dirs",
     "asset_policy": "execution.asset_policy",
-    "special_video_policy": "execution.special_video_policy",
-    "special_folder_conflict": "execution.special_folder_conflict",
     "batch_size": "execution.batch_size",
     "batch_delay_seconds": "execution.batch_delay_seconds",
     "retry_times": "execution.retry_times",
     "retry_backoff_seconds": "execution.retry_backoff_seconds",
+    "scraper_enabled": "scraper.enabled",
 }
 
+# 旧版单层预设的完整键表：只用于读取 v6 及更早的快照和导入旧文件，
+# 新代码不再用它生成快照。
+LEGACY_PRESET_OPTION_KEYS: dict[str, str] = {
+    **NAMING_PRESET_OPTION_KEYS,
+    **WORKFLOW_PRESET_OPTION_KEYS,
+}
 
-def default_preset_options() -> dict[str, Any]:
-    """把全局默认值变成一份预设选项，用于首次生成预设。"""
+# 不进预设的设置项：
+# - 三个密钥（TMDB / Bangumi / AI）避免随预设导出泄露；
+# - 网盘模式是本机读盘策略开关，不是命名/识别选项，切换预设时保持当前值；
+# - 自动执行开关是每次运行都要重新授权的安全开关，不能被预设永久放行；
+# - 语言相关两项是全局设置，不随任何预设变化。
+PRESET_EXCLUDED_KEYS: tuple[str, ...] = (
+    "providers.tmdb_api_key",
+    "providers.bangumi_token",
+    "providers.ai_api_key",
+    "execution.network_drive_mode",
+    "execution.auto_execute_enabled",
+    "providers.tmdb_lang",
+    "metadata.name_language_order",
+)
+
+GLOBAL_ONLY_KEYS: tuple[str, ...] = (
+    "providers.tmdb_lang",
+    "metadata.name_language_order",
+)
+
+# 旧版 /api/presets 接口的明确报错文案：拆分后不能静默返回旧数据。
+LEGACY_PRESET_NOTICE = (
+    "预设已经拆成两层：命名预设（模板与命名/落点选项）和工作流预设（其余设置）。"
+    "请改用 /api/naming-presets 或 /api/workflow-presets；"
+    "导出/导入仍可用 /api/presets/export 与 /api/presets/import（新格式 version 2）。"
+)
+
+
+def default_naming_options() -> dict[str, Any]:
+    """命名预设的默认选项，用于首次生成命名预设。"""
     defaults = _defaults()
-    return {option: defaults[setting] for option, setting in PRESET_OPTION_KEYS.items()}
-
-
-def settings_to_preset_options(values: dict[str, Any]) -> dict[str, Any]:
-    """把当前设置打包成一份预设选项快照（保存预设时使用）。"""
-    specs = {spec.key: spec for spec in SETTING_SPECS}
     return {
-        option: values.get(setting, specs[setting].default)
-        for option, setting in PRESET_OPTION_KEYS.items()
+        option: defaults[setting] for option, setting in NAMING_PRESET_OPTION_KEYS.items()
     }
 
 
-def setting_values_from_preset_options(options: dict[str, Any]) -> dict[str, Any]:
-    """把预设选项快照转回设置键值（切换预设或迁移旧配置时使用）。"""
+def default_workflow_options() -> dict[str, Any]:
+    """工作流预设的默认选项，用于首次生成工作流预设。"""
+    defaults = _defaults()
+    return {
+        option: defaults[setting] for option, setting in WORKFLOW_PRESET_OPTION_KEYS.items()
+    }
+
+
+def _options_from_settings(
+    values: dict[str, Any], keys: dict[str, str]
+) -> dict[str, Any]:
+    specs = {spec.key: spec for spec in SETTING_SPECS}
+    return {
+        option: values.get(setting, specs[setting].default)
+        for option, setting in keys.items()
+    }
+
+
+def naming_options_from_settings(values: dict[str, Any]) -> dict[str, Any]:
+    return _options_from_settings(values, NAMING_PRESET_OPTION_KEYS)
+
+
+def workflow_options_from_settings(values: dict[str, Any]) -> dict[str, Any]:
+    return _options_from_settings(values, WORKFLOW_PRESET_OPTION_KEYS)
+
+
+def _settings_from_options(
+    options: dict[str, Any], keys: dict[str, str]
+) -> dict[str, Any]:
     specs = {spec.key: spec for spec in SETTING_SPECS}
     values: dict[str, Any] = {}
-    for option, setting in PRESET_OPTION_KEYS.items():
-        if option not in options:
-            continue
-        value = options[option]
-        if value is None or value == "":
-            continue
+    for option, setting in keys.items():
         spec = specs.get(setting)
-        values[setting] = _coerce(spec, value) if spec else value
+        if spec is None:
+            continue
+        value = options.get(option)
+        if value is None:
+            value = spec.default
+        elif spec.type == "string" and not str(value).strip() and spec.default:
+            # 旧预设里的空字符串表示“当时没有保存这一项”，按默认值补齐
+            value = spec.default
+        values[setting] = _coerce(spec, value)
     return values
+
+
+def naming_settings_from_options(options: dict[str, Any]) -> dict[str, Any]:
+    """把命名预设快照转回设置键值（切换命名预设时使用）。"""
+    return _settings_from_options(options, NAMING_PRESET_OPTION_KEYS)
+
+
+def workflow_settings_from_options(options: dict[str, Any]) -> dict[str, Any]:
+    """把工作流预设快照转回设置键值（切换工作流预设时使用）。"""
+    return _settings_from_options(options, WORKFLOW_PRESET_OPTION_KEYS)
+
+
+def setting_values_from_preset_options(options: dict[str, Any]) -> dict[str, Any]:
+    """旧版单层快照转回设置键值，仅用于 v2 设置迁移和旧文件导入。"""
+    return _settings_from_options(options, LEGACY_PRESET_OPTION_KEYS)
 
 
 def _coerce(spec: SettingSpec, value: Any) -> Any:

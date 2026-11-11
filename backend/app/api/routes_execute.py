@@ -32,6 +32,8 @@ from ..core.rescan import light_recheck
 from ..core.scan_store import get_scan, save_scan
 from ..store import (
     active_operation,
+    claim_run,
+    ensure_run,
     get_operation,
     get_operation_progress,
     insert_operation_items,
@@ -40,12 +42,15 @@ from ..store import (
     mark_operation_status,
     operation_conflict_items,
     operation_item_counts,
+    record_decision,
     reset_operation_items,
     save_operation,
     set_operation_batches,
     set_operation_status,
     update_operation_item,
+    update_operation_item_decision,
     update_operation_summary,
+    update_run,
 )
 
 router = APIRouter()
@@ -72,7 +77,9 @@ class TemplateSpec(BaseModel):
 
 class ExecuteRequest(BaseModel):
     scan_id: str | None = None
+    # preset_id 保留给旧调用方；两层拆分后命名预设 id 优先从 naming_preset_id 取。
     preset_id: str | None = None
+    naming_preset_id: str | None = None
     templates: dict[str, TemplateSpec] | None = None
     file_ids: list[str] | None = None
     folder_ids: list[str] | None = None
@@ -135,13 +142,24 @@ def _busy_message() -> str:
     return ""
 
 
+def _claim_operation_run(operation_id: str, stage: str = "execute") -> None:
+    """续跑 / 继续 / 处理冲突时，重新占住这次运行的推进权。"""
+    operation = get_operation(operation_id) or {}
+    scan_id = str(operation.get("scan_id") or "")
+    if not scan_id:
+        return
+    run = ensure_run(scan_id, naming_preset_id=str(operation.get("preset_id") or "") or None)
+    claim_run(run["id"], operation_id)
+    update_run(run["id"], stage=stage, operation_id=operation_id)
+
+
 @router.post("/execute")
 def execute(payload: ExecuteRequest) -> dict:
     # 设置页是唯一权威：预设只提供命名模板，目录组来自扫描快照
     settings = load_settings()
-    preset = load_preset(payload.preset_id)
+    preset = load_preset(payload.naming_preset_id or payload.preset_id)
     if preset is None:
-        raise HTTPException(status_code=500, detail="没有可用预设")
+        raise HTTPException(status_code=500, detail="没有可用命名预设")
 
     scan_payload = get_scan(payload.scan_id) if payload.scan_id else None
     if scan_payload is None:
@@ -251,6 +269,23 @@ def execute(payload: ExecuteRequest) -> dict:
     if not manager.running():
         set_operation_status(operation_id, "interrupted")
         raise HTTPException(status_code=409, detail="启动执行任务失败，请稍后重试")
+    if payload.scan_id:
+        run = ensure_run(payload.scan_id, naming_preset_id=preset["id"])
+        claim_run(run["id"], operation_id)
+        update_run(
+            run["id"],
+            stage="execute",
+            operation_id=operation_id,
+            preset_id=preset["id"],
+            snapshot_patch={
+                "naming_preset_id": preset["id"],
+                "execute": {
+                    "operation_id": operation_id,
+                    "total": len(plan),
+                    "batch_count": batch_count,
+                },
+            },
+        )
     return {
         "preset_id": preset["id"],
         "preset_name": preset["name"],
@@ -305,6 +340,7 @@ def continue_paused(operation_id: str) -> dict:
     if not manager.start(operation_id, policy, keep_empty_dirs):
         set_operation_status(operation_id, "paused")
         raise HTTPException(status_code=409, detail="启动执行任务失败，请稍后重试")
+    _claim_operation_run(operation_id)
     return {"operation_id": operation_id, "status": "queued"}
 
 
@@ -381,6 +417,7 @@ def resume(operation_id: str, payload: ResumeRequest | None = None) -> dict:
     if not manager.start(operation_id, policy, keep_empty_dirs):
         set_operation_status(operation_id, "interrupted")
         raise HTTPException(status_code=409, detail="启动续跑任务失败，请稍后重试")
+    _claim_operation_run(operation_id)
     return {"operation_id": operation_id, "status": "queued", "reset": reset}
 
 
@@ -621,6 +658,16 @@ def resolve(operation_id: str, payload: ResolveRequest) -> dict:
         if item is None:
             unknown.append(str(choice.seq))
             continue
+        # 记录是谁拍的板：冲突选择属于人工确认，以后接 AI 只换 source。
+        record_decision(
+            str(operation.get("scan_id") or ""),
+            "conflict",
+            f"{operation_id}:{choice.seq}",
+            choice=str(choice.action),
+            source="human",
+            operation_id=operation_id,
+        )
+        update_operation_item_decision(operation_id, int(choice.seq), "human")
         if item.get("category") == "folder":
             _resolve_folder(operation_id, item, choice.action, stats)
         else:
@@ -642,6 +689,7 @@ def resolve(operation_id: str, payload: ResolveRequest) -> dict:
     if not manager.start(operation_id, "skip", keep_empty_dirs):
         set_operation_status(operation_id, "conflict")
         raise HTTPException(status_code=409, detail="启动冲突处理任务失败，请稍后重试")
+    _claim_operation_run(operation_id)
     return {
         "operation_id": operation_id,
         "status": "queued",

@@ -32,6 +32,7 @@ from ..store import (
     list_aliases,
     list_assignments,
     list_special_memory,
+    record_decision,
     remember_special_folder,
     update_alias,
     update_assignment,
@@ -108,6 +109,8 @@ def identify_confirm_all(payload: ConfirmAllRequest) -> dict:
     """一键确认「已指派待确认」里的全部作品，一次写回。"""
     scan = _scan_or_404(payload.scan_id)
     count = confirm_all(scan)
+    if count:
+        record_decision(payload.scan_id, "confirm", "all", choice=f"确认 {count} 个作品")
     refresh_queue(scan)
     save_scan(scan)
     data = _overview(scan)
@@ -147,6 +150,13 @@ def identify_assign(payload: AssignRequest) -> dict:
         raise HTTPException(status_code=400, detail="请填写作品名称")
 
     assign_rows(scan, file_ids, title, year)
+    for file_id in file_ids:
+        record_decision(
+            payload.scan_id,
+            "assign",
+            str(file_id),
+            choice=f"{title}" + (f" ({year})" if year else ""),
+        )
     # 指派后条目的作品信息要跟着更新，清单才能按新作品折叠
     refresh_queue(scan)
     save_scan(scan)
@@ -207,6 +217,12 @@ def identify_ignore(payload: IgnoreRequest) -> dict:
     if not payload.segment.strip():
         raise HTTPException(status_code=400, detail="缺少名称段")
     ignore_segment(scan, payload.group_id, payload.segment)
+    record_decision(
+        payload.scan_id,
+        "ignore",
+        f"{payload.group_id}:{payload.segment}",
+        choice=payload.segment,
+    )
     refresh_queue(scan)
     save_scan(scan)
     return _overview(scan)
@@ -222,6 +238,7 @@ def identify_confirm(payload: ConfirmRequest) -> dict:
     scan = _scan_or_404(payload.scan_id)
     if confirm_work(scan, payload.work_id) == 0:
         raise HTTPException(status_code=404, detail="作品不存在或已被修改")
+    record_decision(payload.scan_id, "confirm", payload.work_id, choice="确认作品")
     refresh_queue(scan)
     save_scan(scan)
     return _overview(scan)
@@ -380,6 +397,12 @@ def identify_special(payload: SpecialRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail="未知的特典处理方式")
 
+    record_decision(
+        payload.scan_id,
+        "special",
+        folder_key,
+        choice=f"{payload.action}:{payload.work_id or ''}",
+    )
     refresh_queue(scan)
     save_scan(scan)
     return _overview(scan)
@@ -436,6 +459,12 @@ def identify_collection(payload: CollectionDecisionRequest) -> dict:
     else:
         raise HTTPException(status_code=400, detail="未知的合集处理方式")
     scan["collection_decisions"] = decisions
+    record_decision(
+        payload.scan_id,
+        "collection",
+        file_id,
+        choice=payload.action + (f":{payload.season}" if payload.season is not None else ""),
+    )
     refresh_queue(scan)
     save_scan(scan)
     return _overview(scan)
@@ -462,5 +491,11 @@ def identify_duplicates(payload: DuplicateDecisionRequest) -> dict:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    record_decision(
+        payload.scan_id,
+        "duplicate",
+        payload.key,
+        choice=payload.action + (f":{payload.target_file_id}" if payload.target_file_id else ""),
+    )
     save_scan(scan)
     return {"decision": decision}

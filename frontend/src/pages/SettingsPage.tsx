@@ -24,6 +24,7 @@ import {
 import { ApiOutlined, SaveOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { api } from "../api";
+import PageSections from "../components/SectionNav";
 import type { ConfigFieldSpec, ConfigSchema, PatternCacheEntry, ProviderTestResult, RuleInfo, RuleInput } from "../types";
 
 const EMPTY_RULE: RuleInput = {
@@ -112,10 +113,12 @@ export default function SettingsPage() {
       .map((group) => ({
         ...group,
         // 「同款目录自动套用」放到下面的缓存管理卡片里，避免出现两个开关
+        // 「自动执行」放到单独的风险卡片里，避免风险说明被折叠进普通设置
         fields: schema.fields.filter(
           (field) =>
             field.group === group.key &&
-            field.key !== "providers.ai_pattern_cache_auto_apply",
+            field.key !== "providers.ai_pattern_cache_auto_apply" &&
+            field.key !== "execution.auto_execute_enabled",
         ),
       }))
       .filter((group) => group.fields.length > 0);
@@ -488,8 +491,18 @@ export default function SettingsPage() {
   }
 
   return (
+    <PageSections
+      items={[
+        { id: "sec-env", label: "运行环境" },
+        { id: "sec-auto-execute", label: "自动执行" },
+        ...groups.map((group) => ({ id: `sec-setting-${group.key}`, label: group.label })),
+        { id: "sec-patterns", label: "命名规律缓存" },
+        { id: "sec-auth", label: "访问密码" },
+        { id: "sec-network", label: "网络连通性" },
+      ]}
+    >
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card>
+      <Card id="sec-env" data-section>
         <Title level={5} style={{ marginTop: 0 }}>
           运行环境
         </Title>
@@ -504,7 +517,7 @@ export default function SettingsPage() {
           showIcon
           style={{ marginTop: 12 }}
           message="这里是所有工作流设置的唯一来源"
-          description="字幕、特典、季号、冲突处理等设置对所有预设生效。切换预设时，如果预设里记录过一套不同的设置，系统会先询问你是否覆盖当前设置。"
+          description="字幕、特典、季号、冲突处理等设置对所有预设生效。预设现在会保存整套设置；切换预设时如果和当前设置不一样，系统会先问你，也可以选只换名字不改设置。"
         />
         {rules.length > 0 && (
           <Collapse
@@ -550,9 +563,53 @@ export default function SettingsPage() {
         )}
       </Card>
 
+      <Card id="sec-auto-execute" data-section title="自动执行">
+        <Alert
+          type="warning"
+          showIcon
+          message="开启后程序可能在无人看守时改动真实文件，请先看完这段风险"
+          description={
+            <ul style={{ margin: 0, paddingLeft: 18 }}>
+              <li>无人看守时可能改错文件：命名模板、目录组或目标路径判断有误，都会直接改动真实文件。</li>
+              <li>撤销依赖执行记录；如果文件随后被移动、覆盖，或原目标已不存在，撤销未必能完全恢复。</li>
+              <li>这个开关只是允许自动执行；每次自动执行仍要单独授权，授权只能用一次。</li>
+              <li>预览零警告、零冲突、零未归属、季号全部确定四项门槛必须全绿，缺一项都会拒绝执行。</li>
+            </ul>
+          }
+        />
+        <Row gutter={16} align="middle" style={{ marginTop: 16 }}>
+          <Col xs={24} md={7}>
+            <div style={{ fontWeight: 500 }}>允许自动执行（每次仍需单独授权）</div>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              execution.auto_execute_enabled
+            </Text>
+          </Col>
+          <Col xs={24} md={9}>
+            <Space size={12}>
+              <Switch
+                checked={Boolean(values["execution.auto_execute_enabled"])}
+                onChange={(checked) => updateValue("execution.auto_execute_enabled", checked)}
+              />
+              <Text>
+                {values["execution.auto_execute_enabled"]
+                  ? "已开启：仍需每次单独授权"
+                  : "已关闭（默认）"}
+              </Text>
+            </Space>
+          </Col>
+          <Col xs={24} md={8}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              默认关闭。改完要点页面底部的「保存设置」才生效；保存后去「模板与预览」页点「自动执行（需授权）」。
+            </Text>
+          </Col>
+        </Row>
+      </Card>
+
       {groups.map((group) => (
         <Card
           key={group.key}
+          id={`sec-setting-${group.key}`}
+          data-section
           title={group.label}
           extra={
             group.key === "parse" ? (
@@ -560,6 +617,15 @@ export default function SettingsPage() {
             ) : null
           }
         >
+          {group.key === "language" && (
+            <Alert
+              type="info"
+              showIcon
+              style={{ marginBottom: 16 }}
+              message="语言设置是全局的，不随预设变化"
+              description="TMDB 语言和作品名语言顺序对所有扫描、匹配和命名统一生效。切换命名预设或工作流预设都不会改变这两项；预设里也不再保存它们。"
+            />
+          )}
           {group.key === "providers" && (
             <Alert
               type="info"
@@ -591,6 +657,8 @@ export default function SettingsPage() {
       ))}
 
       <Card
+        id="sec-patterns"
+        data-section
         title="命名规律缓存"
         extra={<Text type="secondary">共 {patternEntries.length} 条</Text>}
       >
@@ -636,7 +704,7 @@ export default function SettingsPage() {
         </Space>
       </Card>
 
-      <Card title="访问密码" extra={<Text type="secondary">密码只保存不可逆哈希</Text>}>
+      <Card id="sec-auth" data-section title="访问密码" extra={<Text type="secondary">密码只保存不可逆哈希</Text>}>
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Alert
             type={authEnabled ? "success" : "info"}
@@ -672,7 +740,12 @@ export default function SettingsPage() {
         </Space>
       </Card>
 
-      <Card title="网络连通性测试" extra={<Text type="secondary">会使用上面的代理和 API Key</Text>}>
+      <Card
+        id="sec-network"
+        data-section
+        title="网络连通性测试"
+        extra={<Text type="secondary">会使用上面的代理和 API Key</Text>}
+      >
         <Space direction="vertical" size={12} style={{ width: "100%" }}>
           <Space wrap>
             <Button icon={<ApiOutlined />} loading={testing} onClick={handleTest}>
@@ -706,7 +779,7 @@ export default function SettingsPage() {
         </Space>
         <Divider />
         <Text type="secondary">
-          设置保存后立即生效。预设只保存「正片 / 特典 / 剧场版」三种命名规则。
+          设置保存后立即生效。预设会保存整套设置和三种命名规则；切换预设时按「先问再做」处理。
         </Text>
       </Card>
 
@@ -828,5 +901,6 @@ export default function SettingsPage() {
         </Space>
       </Modal>
     </Space>
+    </PageSections>
   );
 }

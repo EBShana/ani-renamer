@@ -7,6 +7,7 @@ from pydantic import BaseModel
 
 from ..core import queue
 from ..core.scan_store import get_scan, save_scan
+from ..store import ensure_run, update_run
 
 router = APIRouter()
 
@@ -41,6 +42,18 @@ def move_entries(payload: MoveRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     save_scan(scan)
+    if moved:
+        run = ensure_run(payload.scan_id, scan.get("groups") or [])
+        update_run(
+            run["id"],
+            stage=payload.to_stage,
+            snapshot_patch={
+                payload.to_stage: {
+                    "from": payload.from_stage,
+                    "moved": moved,
+                }
+            },
+        )
     data = queue.overview(scan)
     data["moved"] = moved
     return data

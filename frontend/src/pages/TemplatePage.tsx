@@ -9,6 +9,7 @@ import {
   Divider,
   Empty,
   Input,
+  InputNumber,
   Modal,
   Progress,
   Row,
@@ -18,6 +19,7 @@ import {
   Table,
   Tag,
   Tooltip,
+  Tree,
   Typography,
   message,
 } from "antd";
@@ -25,26 +27,32 @@ import {
   CopyOutlined,
   DeleteOutlined,
   DownloadOutlined,
+  FileOutlined,
+  FolderOutlined,
   PauseCircleOutlined,
-  PlayCircleOutlined,
+  SafetyCertificateOutlined,
   SaveOutlined,
   StarOutlined,
   UploadOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
+import type { DataNode } from "antd/es/tree";
 import { api } from "../api";
+import PageSections from "../components/SectionNav";
 import type {
   Category,
   ConflictAction,
   ConflictItem,
   ConflictView,
   DuplicateGroup,
+  ExecuteRow,
   FieldPayload,
+  GateResult,
   Kind,
   OperationProgress,
+  NamingPreset,
   OperationRecord,
   ParsedFile,
-  Preset,
   PreviewResponse,
   PreviewRow,
   QueueEntry,
@@ -56,6 +64,13 @@ import { CATEGORY_LABELS } from "../types";
 import ListFilterBar, { EMPTY_FILTER, entryMatches, type ListFilterValue } from "../listFilters";
 
 const { Text, Title } = Typography;
+
+const DECISION_SOURCE_LABELS: Record<string, string> = {
+  human: "人工确认",
+  rule: "规则自动",
+  ai: "AI 决策（预留）",
+  "": "未知",
+};
 
 const RESOLVE_LABELS: Record<string, string> = {
   skip: "跳过",
@@ -137,6 +152,25 @@ const historyColumns = (
     render: (value: string) => {
       const meta = OPERATION_STATUS_TAGS[value] ?? OPERATION_STATUS_TAGS.done;
       return <Tag color={meta.color}>{meta.label}</Tag>;
+    },
+  },
+  {
+    title: "决策来源",
+    dataIndex: "decision_counts",
+    width: 170,
+    render: (value: OperationRecord["decision_counts"]) => {
+      const data = value || { human: 0, rule: 0, ai: 0, unknown: 0 };
+      return (
+        <Space size={2} wrap>
+          {data.human > 0 && <Tag color="blue">人工 {data.human}</Tag>}
+          {data.rule > 0 && <Tag>规则 {data.rule}</Tag>}
+          {data.ai > 0 && <Tag color="purple">AI {data.ai}</Tag>}
+          {data.unknown > 0 && <Tag>未知 {data.unknown}</Tag>}
+          {!data.human && !data.rule && !data.ai && !data.unknown && (
+            <Text type="secondary">-</Text>
+          )}
+        </Space>
+      );
     },
   },
   {
@@ -235,28 +269,38 @@ interface Props {
   scan: ScanPayload | null;
   queue: QueueView | null;
   reloadQueue: () => Promise<void>;
-  presets: Preset[];
-  presetId: string;
-  onPresetChange: (id: string) => void;
-  reloadPresets: (selectId?: string) => Promise<Preset[]>;
+  namingPresets: NamingPreset[];
+  namingPresetId: string;
+  onNamingPresetChange: (id: string) => void;
+  reloadNamingPresets: (selectId?: string) => Promise<NamingPreset[]>;
+  onPresetsImported: () => Promise<void>;
   onGoScan: () => void;
+  onGoMatch: () => void;
+  onGoSettings: () => void;
   onScan: (payload: ScanPayload) => void;
+  onSettingsChanged: () => void;
+  settingsVersion: number;
 }
 
 export default function TemplatePage({
   scan,
   queue,
   reloadQueue,
-  presets,
-  presetId,
-  onPresetChange,
-  reloadPresets,
+  namingPresets,
+  namingPresetId,
+  onNamingPresetChange,
+  reloadNamingPresets,
+  onPresetsImported,
   onGoScan,
+  onGoMatch,
+  onGoSettings,
   onScan,
+  onSettingsChanged,
+  settingsVersion,
 }: Props) {
   const [checkedEntries, setCheckedEntries] = useState<string[]>([]);
   const [filters, setFilters] = useState<ListFilterValue>(EMPTY_FILTER);
-  const [draft, setDraft] = useState<Preset | null>(null);
+  const [draft, setDraft] = useState<NamingPreset | null>(null);
   const [kind, setKind] = useState<Kind>("episode");
   const [fields, setFields] = useState<FieldPayload | null>(null);
   const [validation, setValidation] = useState<{ errors: string[]; warnings: string[] }>({
@@ -264,17 +308,32 @@ export default function TemplatePage({
     warnings: [],
   });
   const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  // 预览页默认看目录树，切到列表只是换展示，不重新请求、不改筛选
+  const [viewMode, setViewMode] = useState<"tree" | "list">("tree");
+  const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [configValues, setConfigValues] = useState<Record<string, unknown>>({});
   const [saveAsOpen, setSaveAsOpen] = useState(false);
   const [saveAsName, setSaveAsName] = useState("");
   const [executing, setExecuting] = useState(false);
+  // 自动执行授权：先看门槛，全绿才能填确认人并生成一次性授权
+  const [autoOpen, setAutoOpen] = useState(false);
+  const [autoLoading, setAutoLoading] = useState(false);
+  const [autoSubmitting, setAutoSubmitting] = useState(false);
+  const [autoRunId, setAutoRunId] = useState("");
+  const [autoEnabled, setAutoEnabled] = useState(false);
+  const [autoGate, setAutoGate] = useState<GateResult | null>(null);
+  const [autoRisk, setAutoRisk] = useState<{ version: string; text: string } | null>(null);
+  const [autoName, setAutoName] = useState("");
   const [previewNonce, setPreviewNonce] = useState(0);
   const [duplicateChecked, setDuplicateChecked] = useState<Record<string, string[]>>({});
   const [explainFiles, setExplainFiles] = useState<string[] | null>(null);
   const [progress, setProgress] = useState<OperationProgress | null>(null);
   const [history, setHistory] = useState<OperationRecord[]>([]);
+  const [historyItems, setHistoryItems] = useState<
+    Record<string, ExecuteRow[] | "loading">
+  >({});
   const [undoing, setUndoing] = useState("");
   const [conflictView, setConflictView] = useState<ConflictView | null>(null);
   const [conflictChoices, setConflictChoices] = useState<Record<number, ConflictAction>>({});
@@ -306,6 +365,17 @@ export default function TemplatePage({
   useEffect(() => {
     loadHistory();
   }, []);
+
+  const loadHistoryItems = async (operationId: string) => {
+    if (historyItems[operationId]) return;
+    setHistoryItems((current) => ({ ...current, [operationId]: "loading" }));
+    try {
+      const detail = await api.historyDetail(operationId);
+      setHistoryItems((current) => ({ ...current, [operationId]: detail.items || [] }));
+    } catch {
+      setHistoryItems((current) => ({ ...current, [operationId]: [] }));
+    }
+  };
 
   useEffect(() => {
     setCheckedEntries(scan?.selections?.preview ?? []);
@@ -345,14 +415,53 @@ export default function TemplatePage({
       .catch(() => {
         // 读取设置失败时使用后端默认策略，不阻塞预览
       });
-  }, []);
+  }, [settingsVersion]);
 
   useEffect(() => {
-    const current = presets.find((item) => item.id === presetId) ?? presets[0];
+    const current =
+      namingPresets.find((item) => item.id === namingPresetId) ?? namingPresets[0];
     if (current) {
-      setDraft(JSON.parse(JSON.stringify(current)) as Preset);
+      setDraft(JSON.parse(JSON.stringify(current)) as NamingPreset);
     }
-  }, [presetId, presets]);
+  }, [namingPresetId, namingPresets]);
+
+  // 命名这一层的“已修改”单独算：只比 13 个命名/落点选项 + 3 条模板，
+  // 不把工作流设置混进来。
+  const NAMING_OPTION_SETTINGS: [keyof NamingPreset["options"], string][] = [
+    ["subtitle_mode", "naming.subtitle_mode"],
+    ["auto_append_ext", "naming.auto_append_ext"],
+    ["max_filename_bytes", "naming.max_filename_bytes"],
+    ["forbidden_chars", "naming.forbidden_chars"],
+    ["specials_dir", "naming.specials_dir"],
+    ["preserve_structure", "naming.preserve_structure"],
+    ["movie_layout", "naming.movie_layout"],
+    ["special_folder_suffix", "naming.special_folder_suffix"],
+    ["default_season", "parse.default_season"],
+    ["special_season_zero", "parse.special_season_zero"],
+    ["ova_policy", "parse.ova_policy"],
+    ["special_video_policy", "execution.special_video_policy"],
+    ["special_folder_conflict", "execution.special_folder_conflict"],
+  ];
+
+  const namingDirty = useMemo(() => {
+    const current =
+      namingPresets.find((item) => item.id === namingPresetId) ?? null;
+    if (!current) return { options: 0, templates: 0 };
+    const options = NAMING_OPTION_SETTINGS.filter(([option, setting]) => {
+      const saved = current.options?.[option];
+      const live = configValues[setting];
+      if (saved === undefined || live === undefined) return false;
+      return String(saved) !== String(live);
+    }).length;
+    const templates = (["episode", "special", "movie"] as Kind[]).filter(
+      (kindKey) =>
+        JSON.stringify(current.templates?.[kindKey] ?? {}) !==
+        JSON.stringify(draft?.templates?.[kindKey] ?? {}),
+    ).length;
+    return { options, templates };
+  }, [namingPresets, namingPresetId, configValues, draft]);
+
+  const namingDirtyTotal = namingDirty.options + namingDirty.templates;
 
   const previewEntries = useMemo(
     () => (queue?.entries ?? []).filter((entry) => entry.stage === "preview"),
@@ -370,7 +479,7 @@ export default function TemplatePage({
           api.validate(template.pattern, template.output_mode),
           api.preview({
             scan_id: scan?.scan_id,
-            preset_id: draft.id,
+            naming_preset_id: draft.id,
             templates: draft.templates,
             file_ids: queue
               ? previewEntries.flatMap((entry) => (entry.is_folder ? [] : entry.file_ids))
@@ -404,7 +513,8 @@ export default function TemplatePage({
     try {
       const result = await api.saveConfig({ ...configValues, ...patch });
       setConfigValues(result.values);
-      message.success("目录结构设置已保存");
+      onSettingsChanged();
+      message.success("命名选项已保存，点「保存」写回命名预设后就会显示「和预设一致」");
     } catch (error) {
       message.error(`保存失败：${(error as Error).message}`);
     }
@@ -455,13 +565,16 @@ export default function TemplatePage({
     if (!draft) return;
     setSaving(true);
     try {
-      await api.updatePreset(draft.id, {
+      // 不传 options：后端会把当前设置里的命名部分存进这份命名预设，
+      // 保存后「已修改」自然回到「和预设一致」。
+      await api.updateNamingPreset(draft.id, {
         name: draft.name,
         library_profile: draft.library_profile,
         templates: draft.templates,
       });
-      await reloadPresets(draft.id);
-      message.success("预设已保存（当前工作流设置已一并记录）");
+      await reloadNamingPresets(draft.id);
+      onSettingsChanged();
+      message.success("命名预设已保存（模板 + 当前命名选项）");
     } catch (error) {
       message.error(`保存失败：${(error as Error).message}`);
     } finally {
@@ -472,15 +585,15 @@ export default function TemplatePage({
   const handleSaveAs = async () => {
     if (!draft) return;
     try {
-      const created = await api.createPreset({
+      const created = await api.createNamingPreset({
         name: saveAsName.trim() || `${draft.name} 副本`,
         library_profile: draft.library_profile,
         templates: draft.templates,
       });
-      await reloadPresets(created.id);
+      await reloadNamingPresets(created.id);
       setSaveAsOpen(false);
       setSaveAsName("");
-      message.success("已另存为新预设");
+      message.success("已另存为新命名预设");
     } catch (error) {
       message.error(`另存失败：${(error as Error).message}`);
     }
@@ -489,13 +602,18 @@ export default function TemplatePage({
   const handleDelete = () => {
     if (!draft) return;
     Modal.confirm({
-      title: `删除预设「${draft.name}」？`,
-      content: "删除后无法恢复，当前扫描结果不受影响。",
+      title: `删除命名预设「${draft.name}」？`,
+      content:
+        "删除后无法恢复，当前扫描结果不受影响。如果有工作流预设正在使用它，会提示你先换掉。",
       okButtonProps: { danger: true },
       onOk: async () => {
-        await api.deletePreset(draft.id);
-        await reloadPresets();
-        message.success("已删除");
+        try {
+          await api.deleteNamingPreset(draft.id);
+          await reloadNamingPresets();
+          message.success("已删除");
+        } catch (error) {
+          message.error((error as Error).message);
+        }
       },
     });
   };
@@ -503,9 +621,9 @@ export default function TemplatePage({
   const handleDuplicate = async () => {
     if (!draft) return;
     try {
-      const created = await api.duplicatePreset(draft.id);
-      await reloadPresets(created.id);
-      message.success("已复制预设");
+      const created = await api.duplicateNamingPreset(draft.id);
+      await reloadNamingPresets(created.id);
+      message.success("已复制命名预设");
     } catch (error) {
       message.error((error as Error).message);
     }
@@ -514,9 +632,9 @@ export default function TemplatePage({
   const handleSetDefault = async () => {
     if (!draft) return;
     try {
-      await api.setDefaultPreset(draft.id);
-      await reloadPresets(draft.id);
-      message.success("已设为默认预设");
+      await api.setDefaultNamingPreset(draft.id);
+      await reloadNamingPresets(draft.id);
+      message.success("已设为默认命名预设");
     } catch (error) {
       message.error((error as Error).message);
     }
@@ -542,8 +660,9 @@ export default function TemplatePage({
       const text = await file.text();
       const payload = JSON.parse(text) as Record<string, unknown>;
       const result = await api.importPresets(payload);
-      await reloadPresets();
-      message.success(`已导入 ${result.created} 个预设`);
+      await reloadNamingPresets();
+      await onPresetsImported();
+      message.success(`已导入 ${result.created} 条预设（命名 + 工作流）`);
     } catch (error) {
       message.error(`导入失败：${(error as Error).message}`);
     }
@@ -762,7 +881,7 @@ export default function TemplatePage({
     const runExecute = async (confirmRisks: boolean) => {
       const result = await api.execute({
         scan_id: scan.scan_id,
-        preset_id: draft.id,
+        naming_preset_id: draft.id,
         templates: draft.templates,
         file_ids: queue ? selectedFileIds : undefined,
         folder_ids: queue ? selectedFolderIds : undefined,
@@ -780,14 +899,14 @@ export default function TemplatePage({
               <div style={{ marginBottom: 8 }}>
                 发现 {risks.length} 条需要留意的情况，不会自动中止：
               </div>
-              <ul style={{ paddingLeft: 18, maxHeight: 260, overflow: "auto", color: "#a15c00" }}>
+              <ul style={{ paddingLeft: 18, maxHeight: 260, overflow: "auto", color: "var(--ani-warning-text)" }}>
                 {risks.map((risk, index) => (
                   <li key={`${risk.code}-${index}`} style={{ marginBottom: 4 }}>
                     {risk.message}
                   </li>
                 ))}
               </ul>
-              <div style={{ marginTop: 8, color: "#888" }}>
+              <div style={{ marginTop: 8, color: "var(--ani-text-tertiary)" }}>
                 选择「仍然继续」会按原计划执行；「取消」不会改动任何文件。
               </div>
             </div>
@@ -822,7 +941,7 @@ export default function TemplatePage({
           <div>
             将处理 {queue ? selected.length : ready.length} 个勾选条目（{ready.length} 个文件）。
           </div>
-          <div style={{ marginTop: 6, color: "#888" }}>
+          <div style={{ marginTop: 6, color: "var(--ani-text-tertiary)" }}>
             目标已存在的文件不会打断任务，会先标记成「冲突，待处理」继续往下跑；
             全部结束后统一弹出冲突面板，由你决定跳过 / 覆盖 / 生成副本或合并。
             任务在后台分批执行，关掉页面也会继续，执行记录可撤销。
@@ -948,8 +1067,8 @@ export default function TemplatePage({
     });
   };
 
-  if (!presets.length) {
-    return <Empty description="还没有预设，请检查后端是否正常" />;
+  if (!namingPresets.length) {
+    return <Empty description="还没有命名预设，请检查后端是否正常" />;
   }
 
   const rowsByEntry = useMemo(() => {
@@ -968,6 +1087,116 @@ export default function TemplatePage({
     () => new Map<string, ParsedFile>((scan?.files ?? []).map((file) => [file.id, file])),
     [scan],
   );
+
+  // 目录树：根节点就是扫描时设定的目标文件夹，多组并排；文件按目标路径挂到文件夹下
+  const previewTree = useMemo(() => {
+    interface FolderNode {
+      key: string;
+      name: string;
+      folders: Map<string, FolderNode>;
+      files: { key: string; name: string; row: PreviewRow }[];
+    }
+    const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+    const make = (key: string, name: string): FolderNode => ({
+      key,
+      name,
+      folders: new Map(),
+      files: [],
+    });
+    const roots = new Map<string, FolderNode>();
+    const targets = (scan?.groups ?? [])
+      .map((group) => normalize(group.target || ""))
+      .filter(Boolean);
+
+    for (const row of preview?.rows ?? []) {
+      const target = normalize(row.new_path || "");
+      if (!target) continue;
+      const owner = targets.find(
+        (item) => target === item || target.startsWith(`${item}/`),
+      );
+      const rootKey = owner ?? (target.slice(0, target.lastIndexOf("/")) || target);
+      let root = roots.get(rootKey);
+      if (!root) {
+        root = make(rootKey, rootKey);
+        roots.set(rootKey, root);
+      }
+      const relative = target.slice(rootKey.length).replace(/^\/+/, "");
+      const parts = relative.split("/").filter(Boolean);
+      let cursor = root;
+      for (let index = 0; index < Math.max(parts.length - 1, 0); index += 1) {
+        const part = parts[index];
+        let child = cursor.folders.get(part);
+        if (!child) {
+          child = make(`${cursor.key}/${part}`, part);
+          cursor.folders.set(part, child);
+        }
+        cursor = child;
+      }
+      const fileName = parts[parts.length - 1] || row.new_name || "（未命名）";
+      cursor.files.push({
+        key: `${cursor.key}::${row.file_id}::${fileName}`,
+        name: fileName,
+        row,
+      });
+    }
+
+    const countFiles = (node: FolderNode): number =>
+      node.files.length +
+      [...node.folders.values()].reduce((sum, child) => sum + countFiles(child), 0);
+
+    const folderKeys: string[] = [];
+    const leafTitle = (row: PreviewRow, name: string) => (
+      <Space size={6}>
+        <FileOutlined />
+        <span className="preview-name">{name}</span>
+        {row.status === "error" && <Tag color="red">需处理</Tag>}
+        {row.status === "warning" && <Tag color="orange">注意</Tag>}
+        {row.action === "skip" && row.status === "ok" && <Tag>跳过</Tag>}
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          {CATEGORY_LABELS[row.category] ?? row.category}
+        </Text>
+      </Space>
+    );
+    const convert = (node: FolderNode): DataNode => {
+      folderKeys.push(node.key);
+      const folders = [...node.folders.values()].sort((a, b) =>
+        a.name.localeCompare(b.name, "zh"),
+      );
+      const files = [...node.files].sort((a, b) => a.name.localeCompare(b.name, "zh"));
+      const children: DataNode[] = [
+        ...folders.map(convert),
+        ...files.map((file) => ({
+          key: file.key,
+          isLeaf: true,
+          title: leafTitle(file.row, file.name),
+        })),
+      ];
+      return {
+        key: node.key,
+        title: (
+          <Space size={6}>
+            <FolderOutlined />
+            <span>{node.name}</span>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {countFiles(node)} 个文件
+            </Text>
+          </Space>
+        ),
+        children,
+      };
+    };
+    const rootNodes = [...roots.values()].sort((a, b) => a.key.localeCompare(b.key, "zh"));
+    return {
+      treeData: rootNodes.map(convert),
+      folderKeys,
+      total: preview?.rows?.length ?? 0,
+    };
+  }, [preview, scan]);
+
+  useEffect(() => {
+    // 新预览默认全部展开；切换视图不会重置用户的展开/收起
+    setExpandedKeys(previewTree.folderKeys);
+  }, [previewTree]);
 
   const filteredEntries = useMemo(
     () =>
@@ -1020,6 +1249,107 @@ export default function TemplatePage({
   const activeChecked = checkedEntries.filter((id) =>
     previewEntries.some((entry) => entry.entry_id === id),
   );
+
+  const refreshAutoGate = async (runId: string) => {
+    const result = await api.gateCheck(runId);
+    setAutoGate(result.gate);
+  };
+
+  const openAutoExecute = async () => {
+    if (!scan) {
+      message.warning("请先在「扫描」页扫描真实文件，内置示例不能执行");
+      return;
+    }
+    if (preview?.is_sample) {
+      message.warning("当前是内置示例数据，不能自动执行");
+      return;
+    }
+    if (progress && ACTIVE_STATUSES.includes(progress.status)) {
+      message.warning("已有执行任务在进行，请等它完成或取消");
+      return;
+    }
+    setAutoOpen(true);
+    setAutoLoading(true);
+    setAutoGate(null);
+    setAutoName("");
+    try {
+      const current = await api.currentRun();
+      if (!current.run) {
+        message.error("还没有本次运行记录，请先扫描并生成预览");
+        setAutoOpen(false);
+        return;
+      }
+      setAutoRunId(current.run.id);
+      const state = await api.autoExecuteState(current.run.id);
+      setAutoEnabled(state.enabled);
+      setAutoRisk(state.risk);
+      await refreshAutoGate(current.run.id);
+    } catch (error) {
+      message.error(`读取门槛结果失败：${(error as Error).message}`);
+      setAutoOpen(false);
+    } finally {
+      setAutoLoading(false);
+    }
+  };
+
+  const gateFix = (checkId: string) => {
+    setAutoOpen(false);
+    if (checkId === "unassigned_clear" || checkId === "season_clear") {
+      onGoMatch();
+      return;
+    }
+    document.getElementById("sec-preview")?.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+
+  const confirmAutoExecute = async () => {
+    if (!autoRunId || !scan || !draft) return;
+    const name = autoName.trim();
+    if (!name) {
+      message.warning("请填写确认人");
+      return;
+    }
+    const selected = previewEntries.filter((entry) => checkedEntries.includes(entry.entry_id));
+    if (!selected.length) {
+      message.warning("请先勾选要执行的条目");
+      return;
+    }
+    setAutoSubmitting(true);
+    try {
+      const auth = await api.authorizeAutoExecute(autoRunId, name);
+      const authorizationId = auth.authorization?.id;
+      if (!authorizationId) throw new Error("没有拿到授权编号");
+      const selectedFileIds = selected.flatMap((entry) => (entry.is_folder ? [] : entry.file_ids));
+      const selectedFolderIds = selected
+        .filter((entry) => entry.is_folder)
+        .map((entry) => entry.folder_key || "");
+      const result = await api.autoExecute(autoRunId, {
+        authorization_id: authorizationId,
+        scan_id: scan.scan_id,
+        naming_preset_id: draft.id,
+        templates: draft.templates,
+        file_ids: selectedFileIds,
+        folder_ids: selectedFolderIds,
+        confirm_risks: true,
+      });
+      if (result.auto_execute?.started) {
+        message.success("已授权并开始自动执行；这条授权已经使用，不能再用。");
+        setAutoOpen(false);
+        setAutoName("");
+        if (result.operation_id) setProgress(await api.progress(result.operation_id));
+        await loadHistory();
+      } else {
+        message.warning(
+          result.auto_execute?.message || result.message || "执行没有启动，授权未被使用",
+        );
+        await refreshAutoGate(autoRunId);
+      }
+    } catch (error) {
+      message.error(`自动执行失败：${(error as Error).message}`);
+      await refreshAutoGate(autoRunId).catch(() => undefined);
+    } finally {
+      setAutoSubmitting(false);
+    }
+  };
 
   const persistSelection = (ids: string[]) => {
     if (scan) void api.saveSelection(scan.scan_id, "preview", ids).catch(() => undefined);
@@ -1121,17 +1451,36 @@ export default function TemplatePage({
   ];
 
   return (
+    <PageSections
+      items={[
+        { id: "sec-preset", label: "预设与模板" },
+        { id: "sec-preview", label: "预览" },
+        ...(progress ? [{ id: "sec-progress", label: "执行进度" }] : []),
+        { id: "sec-history", label: "执行记录" },
+      ]}
+      primaryAction={{
+        label: "执行",
+        hint: `${activeChecked.length}/${previewEntries.length}`,
+        disabled:
+          !scan ||
+          Boolean(preview?.is_sample) ||
+          Boolean(progress && ACTIVE_STATUSES.includes(progress.status)) ||
+          (queue ? activeChecked.length === 0 : false),
+        loading: executing,
+        onClick: handleExecute,
+      }}
+    >
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
-      <Card>
+      <Card id="sec-preset" data-section>
         <Row gutter={16} align="middle">
           <Col flex="auto">
             <Space wrap>
-              <Text type="secondary">预设</Text>
+              <Text type="secondary">命名预设</Text>
               <Select
                 style={{ minWidth: 240 }}
                 value={draft?.id}
-                onChange={onPresetChange}
-                options={presets.map((item) => ({
+                onChange={onNamingPresetChange}
+                options={namingPresets.map((item) => ({
                   value: item.id,
                   label: `${item.name}${item.is_default ? "（默认）" : ""}`,
                 }))}
@@ -1142,10 +1491,20 @@ export default function TemplatePage({
                 onChange={(event) =>
                   setDraft((previous) => (previous ? { ...previous, name: event.target.value } : previous))
                 }
-                placeholder="预设名称"
+                placeholder="命名预设名称"
               />
-              {draft?.is_default && <Tag color="gold">默认预设</Tag>}
+              {draft?.is_default && <Tag color="gold">默认命名预设</Tag>}
+              {namingDirtyTotal > 0 ? (
+                <Tag color="gold">已修改（命名，{namingDirtyTotal} 项）</Tag>
+              ) : (
+                <Tag color="green">和预设一致</Tag>
+              )}
             </Space>
+            <div style={{ marginTop: 4 }}>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                命名预设只管模板和命名选项。识别、AI、执行这些设置在工作流预设里选，扫描页顶部可以切换。
+              </Text>
+            </div>
           </Col>
           <Col>
             <Space wrap>
@@ -1230,42 +1589,235 @@ export default function TemplatePage({
 
             <Divider style={{ margin: "16px 0 4px" }}>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                目录结构
+                命名选项（随命名预设保存）
               </Text>
             </Divider>
-            <Space direction="vertical" size={8} style={{ width: "100%" }}>
+            <Space direction="vertical" size={10} style={{ width: "100%" }}>
+              <Space wrap>
+                <Text type="secondary" style={{ width: 170 }}>
+                  特典目录叫什么（Season 00）
+                </Text>
+                <Input
+                  key={`specials-${String(configValues["naming.specials_dir"])}`}
+                  style={{ width: 220 }}
+                  defaultValue={String(configValues["naming.specials_dir"] ?? "Season 00")}
+                  onBlur={(event) =>
+                    updateConfig({ "naming.specials_dir": event.target.value })
+                  }
+                  onPressEnter={(event) => (event.target as HTMLInputElement).blur()}
+                />
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  默认 Season 00，主流媒体库推荐
+                </Text>
+              </Space>
               <Checkbox
                 checked={Boolean(configValues["naming.preserve_structure"])}
                 onChange={(event) =>
                   updateConfig({ "naming.preserve_structure": event.target.checked })
                 }
               >
-                只重命名文件：不动文件夹、不改变相对位置
+                保留原目录结构（只重命名文件，不生成作品和季目录）
               </Checkbox>
               <Space wrap>
-                <Text type="secondary">剧场版放在</Text>
+                <Text type="secondary" style={{ width: 170 }}>
+                  电影目录布局
+                </Text>
                 <Select
-                  style={{ width: 190 }}
+                  style={{ width: 220 }}
                   value={String(configValues["naming.movie_layout"] ?? "folder")}
                   onChange={(value) => updateConfig({ "naming.movie_layout": value })}
                   options={[
-                    { value: "folder", label: "作品文件夹内" },
-                    { value: "special", label: "特典季目录内" },
+                    { value: "folder", label: "放在作品文件夹内" },
+                    { value: "special", label: "放进特典季目录" },
                   ]}
                 />
-                <Text type="secondary">
-                  特典季目录：{String(configValues["naming.specials_dir"] ?? "Season 00")}（在设置页修改）
-                </Text>
               </Space>
+              <Space wrap>
+                <Text type="secondary" style={{ width: 170 }}>
+                  特典视频
+                </Text>
+                <Select
+                  style={{ width: 360 }}
+                  value={String(configValues["execution.special_video_policy"] ?? "root")}
+                  onChange={(value) =>
+                    updateConfig({ "execution.special_video_policy": value })
+                  }
+                  options={[
+                    { value: "root", label: "整目录带走（内部不改名）" },
+                    { value: "season", label: "进 Season 00 按特典模板改名" },
+                  ]}
+                />
+              </Space>
+
+              <Collapse
+                ghost
+                size="small"
+                items={[
+                  {
+                    key: "more-naming",
+                    label: <Text type="secondary">更多命名选项 ▾</Text>,
+                    children: (
+                      <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            字幕处理方式
+                          </Text>
+                          <Select
+                            style={{ width: 220 }}
+                            value={String(configValues["naming.subtitle_mode"] ?? "follow")}
+                            onChange={(value) =>
+                              updateConfig({ "naming.subtitle_mode": value })
+                            }
+                            options={[
+                              { value: "follow", label: "跟随视频重命名（保留语言后缀）" },
+                              { value: "keep", label: "保持原字幕文件名" },
+                            ]}
+                          />
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            自动补全扩展名
+                          </Text>
+                          <Checkbox
+                            checked={Boolean(configValues["naming.auto_append_ext"])}
+                            onChange={(event) =>
+                              updateConfig({ "naming.auto_append_ext": event.target.checked })
+                            }
+                          >
+                            模板没写 {"{ext}"} 时自动补上原扩展名
+                          </Checkbox>
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            文件名最大字节数
+                          </Text>
+                          <InputNumber
+                            key={`bytes-${String(configValues["naming.max_filename_bytes"])}`}
+                            min={32}
+                            max={255}
+                            defaultValue={Number(configValues["naming.max_filename_bytes"] ?? 240)}
+                            onBlur={(event) => {
+                              const value = Number((event.target as HTMLInputElement).value);
+                              if (Number.isFinite(value) && value > 0) {
+                                updateConfig({ "naming.max_filename_bytes": value });
+                              }
+                            }}
+                          />
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            强制移除字符
+                          </Text>
+                          <Input
+                            key={`forbidden-${String(configValues["naming.forbidden_chars"])}`}
+                            style={{ width: 260 }}
+                            defaultValue={String(configValues["naming.forbidden_chars"] ?? "")}
+                            onBlur={(event) =>
+                              updateConfig({ "naming.forbidden_chars": event.target.value })
+                            }
+                            onPressEnter={(event) => (event.target as HTMLInputElement).blur()}
+                          />
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            默认 &lt;&gt;:&quot;/\\|?*
+                          </Text>
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            撞名素材文件夹命名格式
+                          </Text>
+                          <Input
+                            key={`suffix-${String(configValues["naming.special_folder_suffix"])}`}
+                            style={{ width: 260 }}
+                            defaultValue={String(
+                              configValues["naming.special_folder_suffix"] ?? "{name} {source_season}",
+                            )}
+                            onBlur={(event) =>
+                              updateConfig({ "naming.special_folder_suffix": event.target.value })
+                            }
+                            onPressEnter={(event) => (event.target as HTMLInputElement).blur()}
+                          />
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            默认季号
+                          </Text>
+                          <InputNumber
+                            key={`season-${String(configValues["parse.default_season"])}`}
+                            min={0}
+                            max={99}
+                            defaultValue={Number(configValues["parse.default_season"] ?? 1)}
+                            onBlur={(event) => {
+                              const value = Number((event.target as HTMLInputElement).value);
+                              if (Number.isFinite(value) && value >= 0) {
+                                updateConfig({ "parse.default_season": value });
+                              }
+                            }}
+                          />
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            认不出季信息时用这个
+                          </Text>
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            特典归入第 0 季
+                          </Text>
+                          <Checkbox
+                            checked={Boolean(configValues["parse.special_season_zero"])}
+                            onChange={(event) =>
+                              updateConfig({ "parse.special_season_zero": event.target.checked })
+                            }
+                          >
+                            特典按 Season 0 处理，便于媒体库识别
+                          </Checkbox>
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            OVA 处理方式
+                          </Text>
+                          <Select
+                            style={{ width: 260 }}
+                            value={String(configValues["parse.ova_policy"] ?? "move")}
+                            onChange={(value) => updateConfig({ "parse.ova_policy": value })}
+                            options={[
+                              { value: "move", label: "归到 Season 00 随路径模板移动" },
+                              { value: "ignore", label: "原地跳过并写忽略标记" },
+                            ]}
+                          />
+                        </Space>
+                        <Space wrap>
+                          <Text type="secondary" style={{ width: 170 }}>
+                            多季同名素材文件夹
+                          </Text>
+                          <Select
+                            style={{ width: 260 }}
+                            value={String(
+                              configValues["execution.special_folder_conflict"] ?? "season",
+                            )}
+                            onChange={(value) =>
+                              updateConfig({ "execution.special_folder_conflict": value })
+                            }
+                            options={[
+                              { value: "season", label: "加季号区分（推荐）" },
+                              { value: "merge", label: "合并进同一个文件夹" },
+                            ]}
+                          />
+                        </Space>
+                      </Space>
+                    ),
+                  },
+                ]}
+              />
+
               <Text type="secondary" style={{ fontSize: 12 }}>
                 {Boolean(configValues["naming.preserve_structure"])
-                  ? "当前：目标目录 / 源目录的相对结构 / 新文件名"
-                  : `当前：目标目录 / 作品 (年份) / Season xx（特典用 ${String(
+                  ? "当前结构：目标目录 / 源目录的相对结构 / 新文件名"
+                  : `当前结构：目标目录 / 作品 (年份) / Season xx（特典用 ${String(
                       configValues["naming.specials_dir"] ?? "Season 00",
                     )}）`}
               </Text>
               <Text type="secondary" style={{ fontSize: 12 }}>
-                字幕处理、冲突处理、空目录清理等设置统一在「设置」页管理。
+                这里的改动会立刻生效；点上方「保存」后会连同当前值写回这份命名预设，
+                「和预设一致 / 已修改」只算模板和这些命名选项，不算工作流设置。
               </Text>
             </Space>
           </Card>
@@ -1295,6 +1847,8 @@ export default function TemplatePage({
       </Row>
 
       <Card
+        id="sec-preview"
+        data-section
         title="预览"
         extra={
           <Space wrap>
@@ -1311,46 +1865,41 @@ export default function TemplatePage({
                 去扫描真实文件
               </Button>
             )}
-            <Tooltip
-              title={
-                !scan
-                  ? "内置示例数据不能执行，请先扫描真实文件"
-                  : preview?.is_sample
-                    ? "当前是示例数据"
-                    : progress && ACTIVE_STATUSES.includes(progress.status)
-                      ? "已有执行任务在进行"
-                      : ""
-              }
-            >
-              <Button
-                type="primary"
-                icon={<PlayCircleOutlined />}
-                loading={executing}
-                disabled={
-                  !scan ||
-                  Boolean(preview?.is_sample) ||
-                  Boolean(progress && ACTIVE_STATUSES.includes(progress.status)) ||
-                  (queue ? activeChecked.length === 0 : false)
-                }
-                onClick={handleExecute}
-              >
-                执行勾选的 {activeChecked.length} 项
+            <Tooltip title="先看四项门槛，全绿才能授权；每次授权只能用一次">
+              <Button icon={<SafetyCertificateOutlined />} onClick={() => void openAutoExecute()}>
+                自动执行（需授权）
               </Button>
             </Tooltip>
           </Space>
         }
       >
-        <Space wrap style={{ marginBottom: 12 }}>
-          <Text type="secondary">
-            本页只包含从「匹配作品」带出来的条目。已选（筛选后）{filteredSelected} / 筛选结果{" "}
-            {filteredEntries.length} / 总已选 {activeChecked.length}
-          </Text>
-          <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), true)}>
-            全选本页
-          </Button>
-          <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), false)}>
-            全不选
-          </Button>
+        <Space wrap style={{ marginBottom: 12 }} align="center">
+          <Segmented
+            value={viewMode}
+            onChange={(value) => setViewMode(value as "tree" | "list")}
+            options={[
+              { label: "目录树", value: "tree" },
+              { label: "文件对比", value: "list" },
+            ]}
+          />
+          {viewMode === "list" ? (
+            <>
+              <Text type="secondary">
+                本页只包含从「匹配作品」带出来的条目。已选（筛选后）{filteredSelected} / 筛选结果{" "}
+                {filteredEntries.length} / 总已选 {activeChecked.length}
+              </Text>
+              <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), true)}>
+                全选本页
+              </Button>
+              <Button size="small" onClick={() => toggleMany(previewEntries.map((entry) => entry.entry_id), false)}>
+                全不选
+              </Button>
+            </>
+          ) : (
+            <Text type="secondary">
+              共 {previewTree.total} 个文件；根节点是扫描时设定的目标文件夹，默认全部展开。
+            </Text>
+          )}
         </Space>
 
         {preview?.duplicates && preview.duplicates.length > 0 && (
@@ -1483,6 +2032,8 @@ export default function TemplatePage({
           </Card>
         )}
 
+        {viewMode === "list" ? (
+          <>
         <ListFilterBar
           value={filters}
           onChange={setFilters}
@@ -1555,6 +2106,32 @@ export default function TemplatePage({
             })}
           />
         )}
+          </>
+        ) : (
+          <div>
+            <Space wrap style={{ marginBottom: 10 }}>
+              <Button size="small" onClick={() => setExpandedKeys(previewTree.folderKeys)}>
+                全部展开
+              </Button>
+              <Button size="small" onClick={() => setExpandedKeys([])}>
+                全部收起
+              </Button>
+            </Space>
+            {previewEntries.length === 0 || previewTree.total === 0 ? (
+              <Empty description="本页还没有条目，请先在「匹配作品」页勾选作品并点「下一步：带出」" />
+            ) : (
+              <Tree
+                className="preview-tree"
+                treeData={previewTree.treeData}
+                expandedKeys={expandedKeys}
+                onExpand={(keys) => setExpandedKeys(keys as string[])}
+                selectable={false}
+                blockNode
+                showLine
+              />
+            )}
+          </div>
+        )}
         {queue && queue.counts.done > 0 && (
           <Alert
             type="success"
@@ -1568,6 +2145,8 @@ export default function TemplatePage({
 
       {progress && (
         <Card
+          id="sec-progress"
+          data-section
           title={
             <Space>
               <span>执行进度</span>
@@ -1711,6 +2290,8 @@ export default function TemplatePage({
       )}
 
       <Card
+        id="sec-history"
+        data-section
         title="执行记录"
         extra={
           <Space>
@@ -1738,6 +2319,73 @@ export default function TemplatePage({
               handleCancel,
               (id) => void openConflicts(id),
             )}
+            expandable={{
+              expandedRowRender: (record) => {
+                const items = historyItems[record.id];
+                if (!items || items === "loading") {
+                  return <Text type="secondary">读取明细中…</Text>;
+                }
+                if (!items.length) {
+                  return <Text type="secondary">这条记录没有明细</Text>;
+                }
+                return (
+                  <Table<ExecuteRow>
+                    size="small"
+                    pagination={false}
+                    rowKey={(row) => `${row.seq ?? ""}-${row.original_path}`}
+                    dataSource={items}
+                    columns={[
+                      { title: "文件", dataIndex: "original_path", ellipsis: true },
+                      {
+                        title: "结果",
+                        dataIndex: "status",
+                        width: 80,
+                        render: (value: string) => <Tag>{value}</Tag>,
+                      },
+                      {
+                        title: "选择",
+                        dataIndex: "choice",
+                        width: 90,
+                        render: (value?: string) => value || "-",
+                      },
+                      {
+                        title: "决策来源",
+                        dataIndex: "decision_source",
+                        width: 140,
+                        render: (value: string, row) => (
+                          <Space size={2} wrap>
+                            <Tag
+                              color={
+                                value === "human" ? "blue" : value === "ai" ? "purple" : undefined
+                              }
+                            >
+                              {DECISION_SOURCE_LABELS[value || ""] || "未知"}
+                            </Tag>
+                            {row.rule_id ? (
+                              <Text type="secondary" style={{ fontSize: 11 }}>
+                                {row.rule_id}
+                              </Text>
+                            ) : null}
+                          </Space>
+                        ),
+                      },
+                      {
+                        title: "决策时间",
+                        dataIndex: "decided_at",
+                        width: 170,
+                        render: (value?: string) =>
+                          value
+                            ? new Date(value).toLocaleString("zh-CN", { hour12: false })
+                            : "-",
+                      },
+                    ]}
+                  />
+                );
+              },
+              onExpand: (expanded, record) => {
+                if (expanded) void loadHistoryItems(record.id);
+              },
+            }}
             scroll={{ x: 900 }}
           />
         )}
@@ -1985,6 +2633,142 @@ export default function TemplatePage({
         )}
       </Modal>
 
+      <Modal
+        title="自动执行授权"
+        open={autoOpen}
+        width={680}
+        onCancel={() => setAutoOpen(false)}
+        styles={{ body: { maxHeight: "calc(100vh - 260px)", overflowY: "auto", paddingRight: 8 } }}
+        footer={
+          <Space wrap>
+            <Button onClick={() => setAutoOpen(false)}>关闭</Button>
+            {autoRunId && (
+              <Button loading={autoLoading} onClick={() => void refreshAutoGate(autoRunId).catch(() => undefined)}>
+                重新检查
+              </Button>
+            )}
+            {!autoEnabled && (
+              <Button
+                type="primary"
+                onClick={() => {
+                  setAutoOpen(false);
+                  onGoSettings();
+                }}
+              >
+                去设置里打开开关
+              </Button>
+            )}
+            {autoEnabled && autoGate?.passed && (
+              <Button
+                type="primary"
+                loading={autoSubmitting}
+                disabled={!autoName.trim() || !activeChecked.length}
+                onClick={() => void confirmAutoExecute()}
+              >
+                确认授权并自动执行
+              </Button>
+            )}
+          </Space>
+        }
+      >
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          {!autoEnabled && (
+            <Alert
+              type="warning"
+              showIcon
+              message="自动执行开关未开启（默认关闭）"
+              description="请到「设置」页的「自动执行」卡片里打开开关并保存。打开后每次执行仍要单独授权。"
+            />
+          )}
+          <Text type="secondary">
+            门槛必须四项全绿才能授权；任何一项未通过都只显示问题，不提供授权按钮，也没有强制跳过。
+          </Text>
+          {autoLoading && <Text type="secondary">正在检查门槛...</Text>}
+          {autoGate && (
+            <>
+              <Alert
+                type={autoGate.passed ? "success" : "error"}
+                showIcon
+                message={autoGate.passed ? "四项检查全部通过" : autoGate.summary}
+                description={`检查时间：${autoGate.checked_at.replace("T", " ").slice(0, 19)}`}
+              />
+              <Space direction="vertical" size={8} style={{ width: "100%" }}>
+                {autoGate.checks.map((check) => (
+                  <div
+                    key={check.id}
+                    style={{
+                      border: "1px solid var(--ani-border, #f0f0f0)",
+                      borderRadius: 8,
+                      padding: "8px 12px",
+                    }}
+                  >
+                    <Space wrap>
+                      <Tag color={check.passed ? "green" : "red"}>
+                        {check.passed ? "通过" : "未通过"}
+                      </Tag>
+                      <Text strong>{check.label}</Text>
+                      {!check.passed && (
+                        <Button size="small" type="link" onClick={() => gateFix(check.id)}>
+                          去处理
+                        </Button>
+                      )}
+                    </Space>
+                    {!check.passed && (
+                      <div style={{ marginTop: 4 }}>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {check.reason || "还有未处理的问题"}
+                        </Text>
+                        {check.issues.slice(0, 3).map((issue) => (
+                          <div key={`${issue.kind}-${issue.ref_id}`} className="path-text">
+                            {issue.title || issue.ref_id}
+                            {issue.reason ? `：${issue.reason}` : ""}
+                          </div>
+                        ))}
+                        {check.issues.length > 3 && (
+                          <Text type="secondary" style={{ fontSize: 12 }}>
+                            还有 {check.issues.length - 3} 条，去对应页面处理
+                          </Text>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </Space>
+            </>
+          )}
+          {autoRisk && (
+            <Alert
+              type="warning"
+              showIcon
+              message={`授权前请确认风险（文案版本 ${autoRisk.version}）`}
+              description={autoRisk.text}
+            />
+          )}
+          {autoEnabled && autoGate?.passed && (
+            <>
+              <div>
+                <div style={{ fontWeight: 500, marginBottom: 4 }}>确认人（会写进授权记录）</div>
+                <Input
+                  value={autoName}
+                  maxLength={40}
+                  placeholder="例如：家里的 NAS 管理员"
+                  onChange={(event) => setAutoName(event.target.value)}
+                />
+              </div>
+              <Alert
+                type="info"
+                showIcon
+                message="本次授权只能使用一次"
+                description="点「确认授权并自动执行」后立即开始执行，这条授权马上失效；以后再执行必须重新授权。"
+              />
+              <Text type="secondary">
+                当前已勾选 {activeChecked.length} 个条目。
+              </Text>
+            </>
+          )}
+        </Space>
+      </Modal>
+
       <input
         ref={importRef}
         type="file"
@@ -1997,5 +2781,6 @@ export default function TemplatePage({
         }}
       />
     </Space>
+    </PageSections>
   );
 }

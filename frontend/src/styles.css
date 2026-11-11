@@ -1,11 +1,38 @@
 :root {
   color-scheme: light;
+  --ani-bg: #f5f6f8;
+  --ani-surface: #ffffff;
+  --ani-text: #111827;
+  --ani-text-secondary: #6b7280;
+  --ani-text-tertiary: #8a8f98;
+  --ani-border: #e5e7eb;
+  --ani-border-strong: #d9d9d9;
+  --ani-subtle: #f1f3f5;
+  --ani-primary: #1677ff;
+  --ani-primary-weak: rgba(22, 119, 255, 0.12);
+  --ani-warning-text: #a15c00;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --ani-bg: #0e0f11;
+  --ani-surface: #1c1d21;
+  --ani-text: #e8e8ea;
+  --ani-text-secondary: #a9abb1;
+  --ani-text-tertiary: #85878f;
+  --ani-border: #2a2c31;
+  --ani-border-strong: #3a3c43;
+  --ani-subtle: #24262b;
+  --ani-primary: #ff8a2b;
+  --ani-primary-weak: rgba(255, 138, 43, 0.16);
+  --ani-warning-text: #e0a040;
 }
 
 body {
   margin: 0;
   font-family: "PingFang SC", "Microsoft YaHei", -apple-system, "Segoe UI", sans-serif;
-  background: #f5f6f8;
+  background: var(--ani-bg);
+  color: var(--ani-text);
 }
 
 .mono {
@@ -16,7 +43,7 @@ body {
 .path-text {
   word-break: break-all;
   font-size: 12px;
-  color: #6b7280;
+  color: var(--ani-text-secondary);
 }
 
 .template-editor {
@@ -24,8 +51,10 @@ body {
   min-height: 120px;
   padding: 12px;
   box-sizing: border-box;
-  border: 1px solid #d9d9d9;
+  border: 1px solid var(--ani-border-strong);
   border-radius: 8px;
+  background: var(--ani-surface);
+  color: var(--ani-text);
   font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
   font-size: 13px;
   line-height: 1.7;
@@ -35,8 +64,8 @@ body {
 }
 
 .template-editor:focus {
-  border-color: #6154f1;
-  box-shadow: 0 0 0 2px rgba(97, 84, 241, 0.12);
+  border-color: var(--ani-primary);
+  box-shadow: 0 0 0 2px var(--ani-primary-weak);
 }
 
 .variable-panel {
@@ -47,18 +76,18 @@ body {
 
 .variable-chip {
   cursor: pointer;
-  border: 1px solid #e5e7eb;
-  background: #fff;
+  border: 1px solid var(--ani-border);
+  background: var(--ani-surface);
   border-radius: 6px;
   padding: 2px 8px;
   font-size: 12px;
   font-family: "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
-  color: #374151;
+  color: var(--ani-text);
 }
 
 .variable-chip:hover {
-  border-color: #6154f1;
-  color: #4b3fe3;
+  border-color: var(--ani-primary);
+  color: var(--ani-primary);
 }
 
 .preview-name {
@@ -82,8 +111,21 @@ body {
 }
 
 .page-card {
-  background: #fff;
+  background: var(--ani-surface);
   border-radius: 12px;
   padding: 20px;
   box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+}
+
+/* 左侧分栏跳转时留出顶部空间，标题不会被顶上切掉 */
+[data-section] {
+  scroll-margin-top: 16px;
+}
+
+.preview-tree .ant-tree-treenode {
+  width: 100%;
+}
+
+.preview-tree .ant-tree-node-content-wrapper {
+  min-width: 0;
 }

@@ -22,7 +22,7 @@ from ..core.metadata import (
 from ..core.matcher import auto_pick, build_groups, build_updates, find_group
 from ..core.season_plan import build_season_plan
 from ..core.scan_store import apply_field_updates, get_scan, save_scan
-from ..store import create_alias, list_aliases, update_alias
+from ..store import create_alias, list_aliases, record_decision, update_alias
 
 router = APIRouter()
 
@@ -392,6 +392,13 @@ def match_apply(payload: ApplyRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
+    record_decision(
+        payload.scan_id,
+        "match",
+        payload.group_id,
+        choice=f"{payload.media_type}:{payload.tmdb_id}",
+        source="human",
+    )
     return {
         "updated": updated,
         "missing": missing,
@@ -420,6 +427,7 @@ def match_rename(payload: RenameRequest) -> dict:
     updated = apply_field_updates(scan["scan_id"], updates)
     save_scan(scan)
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
+    record_decision(payload.scan_id, "rename", payload.group_id, choice=name)
     return {"updated": updated, "name": name, "groups": groups}
 
 
@@ -479,6 +487,7 @@ def match_season(payload: SeasonRequest) -> dict:
     info["choice"] = payload.season
     info["mode"] = "manual"
     save_scan(scan)
+    record_decision(payload.scan_id, "season", payload.group_id, choice=str(payload.season))
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
     return {
         "season": payload.season,

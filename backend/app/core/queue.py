@@ -33,14 +33,16 @@ def _first_segment(rel: str) -> str:
 
 def _work_of(row: dict) -> tuple[str, str, int | None]:
     identify = row.get("identify") if isinstance(row.get("identify"), dict) else {}
+    fields = row.get("fields") if isinstance(row.get("fields"), dict) else {}
     work_id = str(identify.get("work_id") or "").strip()
+    # 匹配 / 改名后 fields.series 才是最新作品名，优先用它；没匹配时再回退识别结果
     title = str(
-        identify.get("title")
-        or (row.get("fields") or {}).get("series")
+        fields.get("series")
+        or identify.get("title")
         or row.get("title")
         or ""
     ).strip()
-    year = identify.get("year")
+    year = fields.get("year") if isinstance(fields.get("year"), int) else identify.get("year")
     return work_id, title, year
 
 

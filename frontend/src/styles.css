@@ -122,6 +122,62 @@ body {
   scroll-margin-top: 16px;
 }
 
+/*
+ * 全站弹窗统一固定在视口正中：
+ * 1. 弹窗挂载在 body 的 .ant-modal-root 下，不受页面滚动位置、祖先定位或 transform 影响；
+ * 2. 用 flex 居中，窗口变小时仍保持正中；
+ * 3. 内容过长时限制在视口内，由弹窗正文自己滚动，头和底部按钮始终可见。
+ */
+body .ant-modal-root .ant-modal-wrap {
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  padding: 16px;
+  box-sizing: border-box;
+}
+
+body .ant-modal-root .ant-modal {
+  top: 0 !important;
+  margin: 0 !important;
+  padding-bottom: 0 !important;
+  max-width: calc(100vw - 32px) !important;
+  max-height: calc(100vh - 32px);
+  display: flex;
+  flex-direction: column;
+}
+
+body .ant-modal-root .ant-modal-content {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 32px);
+  overflow: hidden;
+}
+
+body .ant-modal-root .ant-modal-header,
+body .ant-modal-root .ant-modal-footer {
+  flex: none;
+}
+
+body .ant-modal-root .ant-modal-body {
+  min-height: 0;
+  overflow: auto;
+}
+
+/* 设置页「目录名」可视化编辑：一项一个块，点中后在块尾出现删除叉号 */
+.dir-name-chip {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid var(--ani-border);
+  border-radius: 6px;
+  background: var(--ani-subtle);
+  padding: 0 2px;
+}
+
+.dir-name-chip.is-active {
+  border-color: var(--ani-primary);
+  box-shadow: 0 0 0 2px var(--ani-primary-weak);
+}
+
 .preview-tree .ant-tree-treenode {
   width: 100%;
 }

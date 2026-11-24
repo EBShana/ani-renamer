@@ -38,6 +38,7 @@ import type {
   IdentifyOverview,
   MatchCandidate,
   MatchGroup,
+  MergeInfo,
   ParsedFile,
   PatternApplyResult,
   PatternCheckItem,
@@ -278,6 +279,20 @@ export default function MatchPage({
   const [filters, setFilters] = useState<ListFilterValue>(EMPTY_FILTER);
   const [searching, setSearching] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [lastMerge, setLastMerge] = useState<MergeInfo | null>(null);
+  const visibleMerge = useMemo<MergeInfo | null>(() => {
+    if (lastMerge) return lastMerge;
+    const merges = scan?.merges ?? [];
+    if (!merges.length) return null;
+    const last = merges[merges.length - 1];
+    return {
+      id: last.id,
+      primary: last.primary,
+      title: last.primary_title || "",
+      merged_group_ids: (last.members ?? []).map((item) => item.group_id),
+      count: (last.members?.length ?? 0) + 1,
+    };
+  }, [lastMerge, scan]);
   const [autoLoading, setAutoLoading] = useState(false);
   const [autoResults, setAutoResults] = useState<Record<string, AutoMatchResult>>({});
   const [autoSummary, setAutoSummary] = useState<{ auto: number; ai_pick?: number; choose: number; missing: number } | null>(null);
@@ -660,6 +675,7 @@ export default function MatchPage({
         media_type: candidate.media_type,
       });
       setGroups(result.groups);
+      if (result.merged?.length) setLastMerge(result.merged[result.merged.length - 1]);
       const fresh = await api.getScan(scan.scan_id);
       onScanUpdate(fresh);
       await loadPlan(scan.scan_id);
@@ -687,6 +703,24 @@ export default function MatchPage({
     } finally {
       if (inline) setApplyingGroup("");
       else setApplying(false);
+    }
+  };
+
+  const undoMerge = async () => {
+    if (!scan || !visibleMerge) return;
+    try {
+      const result = await api.matchMergeUndo({
+        scan_id: scan.scan_id,
+        merge_id: visibleMerge.id,
+      });
+      setGroups(result.groups);
+      const fresh = await api.getScan(scan.scan_id);
+      onScanUpdate(fresh);
+      await loadPlan(scan.scan_id);
+      setLastMerge(null);
+      message.success("已撤销合并，恢复成合并前的作品组");
+    } catch (error) {
+      message.error(`撤销合并失败：${(error as Error).message}`);
     }
   };
 
@@ -922,6 +956,7 @@ export default function MatchPage({
     try {
       const result = await api.matchAuto({ scan_id: scan.scan_id });
       setGroups(result.groups);
+      if (result.merged?.length) setLastMerge(result.merged[result.merged.length - 1]);
       setAutoResults(
         Object.fromEntries(result.results.map((item) => [item.group_id, item])),
       );
@@ -1572,6 +1607,19 @@ export default function MatchPage({
       }}
     >
     <Space direction="vertical" size={16} style={{ width: "100%" }}>
+      {visibleMerge && (
+        <Alert
+          type="success"
+          showIcon
+          message={`已自动合并 ${visibleMerge.count} 个「${visibleMerge.title}」作品组`}
+          description="组标题已统一；勾选状态、未归属指派和已有季号都保留。只允许撤销最近一次合并。"
+          action={
+            <Button size="small" onClick={() => void undoMerge()}>
+              撤销合并
+            </Button>
+          }
+        />
+      )}
       <Card id="sec-match" data-section>
         <Row gutter={16} align="middle">
           <Col flex="auto">

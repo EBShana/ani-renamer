@@ -97,6 +97,12 @@ export interface ScanPayload {
   created_at?: string;
   selections?: Record<string, string[]>;
   groups?: DirectoryGroup[];
+  merges?: {
+    id: string;
+    primary: string;
+    primary_title?: string;
+    members?: { group_id: string }[];
+  }[];
   sources: string[];
   files: ParsedFile[];
   stats: {
@@ -596,6 +602,12 @@ export interface ConfigSchema {
   media_root: string;
 }
 
+export interface ConfigRepairNotice {
+  key: string;
+  before: string;
+  after: string;
+}
+
 export interface ProviderTestResult {
   ok: boolean;
   message: string;
@@ -651,7 +663,12 @@ export interface MatchGroup {
   episode_count: number;
   special_count: number;
   movie_count: number;
-  match: { tmdb_id: number | string; name: string; name_source?: string } | null;
+  match: {
+    tmdb_id: number | string;
+    name: string;
+    media_type?: "tv" | "movie" | "";
+    name_source?: string;
+  } | null;
   mixed_match: boolean;
   confidence?: string;
   needs_confirm?: boolean;
@@ -793,9 +810,32 @@ export interface IdentifyOverview {
   };
 }
 
+export interface MergeInfo {
+  id: string;
+  primary: string;
+  title: string;
+  merged_group_ids: string[];
+  count: number;
+}
+
+export interface BatchApplyResult {
+  results: {
+    group_id: string;
+    title: string;
+    ok: boolean;
+    updated?: number;
+    missing?: string[];
+    error?: string;
+    meta?: MatchApplyResult["meta"];
+  }[];
+  merged: MergeInfo[];
+  groups: MatchGroup[];
+}
+
 export interface MatchApplyResult {
   updated: number;
   missing: string[];
+  merged?: MergeInfo[];
   meta: {
     tmdb_id: number;
     media_type: "tv" | "movie";
@@ -832,6 +872,7 @@ export interface AutoMatchResponse {
   groups: MatchGroup[];
   summary: { auto: number; ai_pick?: number; choose: number; missing: number };
   total: number;
+  merged?: MergeInfo[];
 }
 
 export interface RuleInfo {

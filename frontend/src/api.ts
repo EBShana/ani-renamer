@@ -9,6 +9,7 @@ import type {
   AliasRecord,
   AutoExecuteState,
   AutoMatchResponse,
+  BatchApplyResult,
   BrowseResult,
   ConfigSchema,
   ConflictAction,
@@ -380,6 +381,23 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  matchApplyBatch: (payload: {
+    scan_id: string;
+    group_ids: string[];
+    tmdb_id: number;
+    media_type: "tv" | "movie";
+  }) =>
+    request<BatchApplyResult>("/match/apply-batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
+  matchMergeUndo: (payload: { scan_id: string; merge_id?: string }) =>
+    request<{ undone: string; groups: MatchGroup[] }>("/match/merge-undo", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    }),
+
   matchRename: (payload: { scan_id: string; group_id: string; name: string }) =>
     request<{ updated: number; name: string; groups: MatchGroup[] }>("/match/rename", {
       method: "POST",
@@ -623,7 +641,12 @@ export const api = {
 
   fields: () => request<FieldPayload>("/fields"),
 
-  config: () => request<{ values: Record<string, unknown>; media_root: string }>("/config"),
+  config: () =>
+    request<{
+      values: Record<string, unknown>;
+      media_root: string;
+      notices?: import("./types").ConfigRepairNotice[];
+    }>("/config"),
 
   configSchema: () => request<ConfigSchema>("/config/schema"),
 

@@ -3823,6 +3823,331 @@ def main() -> int:
             f"a={first_claim}, b={second_claim}, 释放后 b={third_claim}",
         )
 
+        # ---------------- 16. 扫描页：手动匹配、按作品分组、弹窗居中 ----------------
+        # 匹配 / 改名后，清单条目要读到最新的字段快照，扫描页按作品分组才不会显示旧名字
+        queue_scan = {
+            "files": [
+                {
+                    "id": "q1",
+                    "category": "video",
+                    "group_id": "qg",
+                    "rel_path": "旧名字/Season 1/旧名字 - 01.mkv",
+                    "filename": "旧名字 - 01.mkv",
+                    "parent": "/media/qg/旧名字/Season 1",
+                    "kind": "episode",
+                    "season": 1,
+                    "episode": 1,
+                    "identify": {
+                        "work_id": "w:qg:旧名字|2020",
+                        "title": "旧名字",
+                        "year": 2020,
+                    },
+                    "fields": {"series": "旧名字", "year": 2020},
+                },
+                {
+                    "id": "q2",
+                    "category": "subtitle",
+                    "group_id": "qg",
+                    "rel_path": "旧名字/Season 1/旧名字 - 01.ass",
+                    "filename": "旧名字 - 01.ass",
+                    "parent": "/media/qg/旧名字/Season 1",
+                    "kind": "asset",
+                    "fields": {"original_stem": "旧名字 - 01"},
+                },
+            ],
+            "queue": {
+                "entries": [
+                    {"entry_id": "f:q1", "stage": "match", "result": {"status": "done"}},
+                    {"entry_id": "f:q2", "stage": "scan", "result": None},
+                ]
+            },
+        }
+        queue.refresh_queue(queue_scan)
+        first_entry = next(item for item in queue_scan["queue"]["entries"] if item["entry_id"] == "f:q1")
+        check(
+            "扫描页手动匹配：清单显示识别出的旧作品名",
+            first_entry["title"] == "旧名字"
+            and first_entry["year"] == 2020
+            and first_entry["work_id"] == "w:qg:旧名字|2020",
+            str(first_entry),
+        )
+        queue_scan["files"][0]["fields"]["series"] = "新名字"
+        queue_scan["files"][0]["fields"]["year"] = 2024
+        queue.refresh_queue(queue_scan)
+        after_match = next(item for item in queue_scan["queue"]["entries"] if item["entry_id"] == "f:q1")
+        after_subtitle = next(item for item in queue_scan["queue"]["entries"] if item["entry_id"] == "f:q2")
+        check(
+            "扫描页手动匹配：匹配后作品名与年份跟着更新，归属 id 不变",
+            after_match["title"] == "新名字"
+            and after_match["year"] == 2024
+            and after_match["work_id"] == "w:qg:旧名字|2020",
+            str(after_match),
+        )
+        check(
+            "扫描页手动匹配：其他条目按作品归组时跟着用新名字",
+            after_subtitle["title"] == "新名字" and after_subtitle["work_id"] == "w:qg:旧名字|2020",
+            str(after_subtitle),
+        )
+        check(
+            "扫描页手动匹配：刷新清单不丢失阶段与执行结果",
+            after_match["stage"] == "match"
+            and (after_match.get("result") or {}).get("status") == "done"
+            and after_subtitle["stage"] == "scan",
+            f"{after_match.get('stage')} / {after_match.get('result')} / {after_subtitle.get('stage')}",
+        )
+
+        match_routes_path = Path(__file__).resolve().parent.parent / "app" / "api" / "routes_match.py"
+        match_routes = match_routes_path.read_text(encoding="utf-8")
+        check(
+            "手动匹配接口：匹配 / 改名 / 换季 / 自动匹配后都刷新清单",
+            match_routes.count("refresh_queue(scan)") >= 4
+            and "def match_apply" in match_routes
+            and "def match_rename" in match_routes
+            and "def match_season" in match_routes
+            and "def match_auto" in match_routes,
+            f"refresh_queue 出现 {match_routes.count('refresh_queue(scan)')} 次",
+        )
+
+        # 前端源码在运行镜像里不存在（只有构建产物），因此只在开发目录执行这几项静态检查
+        frontend_src = Path(__file__).resolve().parents[2] / "frontend" / "src"
+        if frontend_src.is_dir():
+            styles = (frontend_src / "styles.css").read_text(encoding="utf-8")
+            scan_page = (frontend_src / "pages" / "ScanPage.tsx").read_text(encoding="utf-8")
+            filter_bar = (frontend_src / "listFilters.tsx").read_text(encoding="utf-8")
+            check(
+                "弹窗居中：样式表统一把弹窗放进视口正中",
+                ".ant-modal-root .ant-modal-wrap" in styles
+                and "align-items: center !important" in styles
+                and "justify-content: center !important" in styles,
+                "styles.css",
+            )
+            check(
+                "弹窗居中：长内容限制在视口内并由弹窗正文滚动",
+                ".ant-modal-content" in styles
+                and ".ant-modal-body" in styles
+                and "overflow: auto" in styles
+                and "max-height: calc(100vh - 32px)" in styles,
+                "styles.css",
+            )
+            check(
+                "扫描页分组：默认按作品，可切换按目录",
+                'useState<"work" | "directory">("work")' in scan_page
+                and 'label: "按作品"' in scan_page
+                and 'label: "按目录"' in scan_page
+                and "leading={" in scan_page
+                and "leading" in filter_bar,
+                "ScanPage.tsx / listFilters.tsx",
+            )
+            check(
+                "扫描页分组：按目录时用文件所在目录做分组标签",
+                "slice(0, -1).join" in scan_page and 'dir || "根目录"' in scan_page,
+                "ScanPage.tsx",
+            )
+            check(
+                "扫描页手动匹配：入口与复用接口都在",
+                "手动匹配" in scan_page
+                and "api.matchSearch" in scan_page
+                and "api.matchApply" in scan_page
+                and "api.identifyAssign" in scan_page
+                and "api.aiMatchSuggest" in scan_page
+                and "api.aiIdentifySuggest" in scan_page,
+                "ScanPage.tsx",
+            )
+            check(
+                "扫描页手动匹配：未归属条目先建立归属再套用同一套匹配",
+                "if (!workId)" in scan_page
+                and "api.queue(scan.scan_id)" in scan_page
+                and "freshEntry?.work_id" in scan_page,
+                "ScanPage.tsx",
+            )
+
+        # ---------------- 17. 批量匹配、同作品组合并、目录名乱码修复 ----------------
+        from app.config import (  # noqa: E402
+            CONFIG_FILE,
+            repair_mojibake,
+            repair_settings_file,
+        )
+        from app.core.matcher import build_groups as build_matcher_groups  # noqa: E402
+        from app.core.merge import merge_same_work, undo_merge  # noqa: E402
+
+        original_names = "SPs,Specials,特典,映像特典,CDs"
+        broken_names = (
+            original_names.encode("utf-8").decode("latin-1").encode("utf-8").decode("latin-1")
+        )
+        fixed_names, changed_names = repair_mojibake(broken_names)
+        check(
+            "目录名乱码：双重编码可还原成原中文",
+            changed_names and fixed_names == original_names,
+            f"{fixed_names!r}",
+        )
+        normal_names, changed_normal = repair_mojibake(original_names)
+        check(
+            "目录名乱码：正常中文不会被误改",
+            not changed_normal and normal_names == original_names,
+            normal_names,
+        )
+
+        config_backup = CONFIG_FILE.read_bytes() if CONFIG_FILE.exists() else None
+        try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(
+                json.dumps(
+                    {
+                        "version": 4,
+                        "values": {"parse.special_dir_names": broken_names},
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            notices = repair_settings_file()
+            raw_bytes = CONFIG_FILE.read_bytes()
+            check(
+                "目录名乱码：加载配置时自动修复并写回正确 UTF-8",
+                any(item["key"] == "parse.special_dir_names" for item in notices)
+                and original_names.encode("utf-8") in raw_bytes
+                and broken_names.encode("utf-8") not in raw_bytes,
+                f"notices={notices}",
+            )
+        finally:
+            if config_backup is None:
+                CONFIG_FILE.unlink(missing_ok=True)
+            else:
+                CONFIG_FILE.write_bytes(config_backup)
+
+        def _merge_row(file_id: str, work_id: str, title: str, episode: int) -> dict:
+            return {
+                "id": file_id,
+                "category": "video",
+                "group_id": "dir-1",
+                "rel_path": f"{work_id}/Season 1/{work_id} - {episode:02d}.mkv",
+                "filename": f"{work_id} - {episode:02d}.mkv",
+                "kind": "episode",
+                "season": 1,
+                "episode": episode,
+                "identify": {"work_id": work_id, "title": title, "year": 2020},
+                "fields": {
+                    "series": "统一作品名",
+                    "tmdb_id": "9999",
+                    "media_type": "tv",
+                    "season": 1,
+                },
+            }
+
+        merge_scan = {
+            "scan_id": "merge-check",
+            "files": [
+                _merge_row("m1", "w-one", "组一", 1),
+                _merge_row("m2", "w-one", "组一", 2),
+                _merge_row("m3", "w-two", "组二", 1),
+                _merge_row("m4", "w-two", "组二", 2),
+            ],
+            "queue": {"entries": []},
+            "season_state": {
+                "w-one": {
+                    "tmdb_id": "9999",
+                    "seasons": [{"season_number": 1, "name": "S1", "episode_count": 12}],
+                    "choice": 1,
+                    "mode": "manual",
+                },
+                "w-two": {
+                    "tmdb_id": "9999",
+                    "seasons": [{"season_number": 1, "name": "S1", "episode_count": 12}],
+                    "choice": 1,
+                    "mode": "manual",
+                },
+            },
+        }
+        merged_info = merge_same_work(merge_scan)
+        merged_groups = build_matcher_groups(merge_scan["files"])
+        merged_work_ids = {
+            item.get("identify", {}).get("work_id") for item in merge_scan["files"]
+        }
+        primary_id = merged_info[0]["primary"] if merged_info else ""
+        check(
+            "同作品合并：同 tmdb_id + media_type 的组会合成一组",
+            len(merged_info) == 1
+            and merged_info[0]["count"] == 2
+            and len(merged_groups) == 1,
+            f"{merged_info} groups={len(merged_groups)}",
+        )
+        check(
+            "同作品合并：行季号与手动季号选择保留",
+            merged_work_ids == {primary_id}
+            and all(item["fields"]["season"] == 1 for item in merge_scan["files"])
+            and merge_scan["season_state"][primary_id]["choice"] == 1,
+            f"{merged_work_ids} state={merge_scan['season_state']}",
+        )
+        undone = undo_merge(merge_scan)
+        restored_ids = {
+            item.get("identify", {}).get("work_id") for item in merge_scan["files"]
+        }
+        check(
+            "同作品合并：可撤销并恢复原来的分组与季号状态",
+            undone == merged_info[0]["id"]
+            and restored_ids == {"w-one", "w-two"}
+            and merge_scan["season_state"]["w-two"]["choice"] == 1
+            and not merge_scan.get("merges"),
+            f"{undone} {restored_ids}",
+        )
+
+        match_routes_source = match_routes_path.read_text(encoding="utf-8")
+        check(
+            "批量匹配接口：一次套用到多个组并逐个返回结果",
+            '@router.post("/match/apply-batch")' in match_routes_source
+            and "results.append" in match_routes_source
+            and '"ok": False' in match_routes_source
+            and "merge_same_work(scan)" in match_routes_source,
+            "routes_match.py",
+        )
+        check(
+            "同作品合并：匹配后自动触发且提供撤销接口",
+            '@router.post("/match/merge-undo")' in match_routes_source
+            and match_routes_source.count("merge_same_work(scan)") >= 3,
+            f"merge_same_work 出现 {match_routes_source.count('merge_same_work(scan)')} 次",
+        )
+
+        if frontend_src.is_dir():
+            batch_modal = (frontend_src / "components" / "BatchMatchModal.tsx")
+            batch_source = batch_modal.read_text(encoding="utf-8") if batch_modal.exists() else ""
+            scan_source = (frontend_src / "pages" / "ScanPage.tsx").read_text(encoding="utf-8")
+            settings_source = (frontend_src / "pages" / "SettingsPage.tsx").read_text(
+                encoding="utf-8"
+            )
+            check(
+                "批量匹配界面：勾选作品组、统一指定、AI 候选逐个确认",
+                batch_modal.exists()
+                and "api.matchApplyBatch" in batch_source
+                and "api.aiMatchSuggest" in batch_source
+                and "AI 建议按作品组给" in batch_source,
+                "BatchMatchModal.tsx",
+            )
+            check(
+                "批量匹配界面：扫描页入口会跨组去重并提示未归属跳过",
+                "批量匹配" in scan_source
+                and "BatchMatchModal" in scan_source
+                and "未归属" in scan_source
+                and "selectedWorkGroups" in scan_source,
+                "ScanPage.tsx",
+            )
+            check(
+                "同作品合并界面：扫描页与匹配页都能撤销合并",
+                "撤销合并" in scan_source and "matchMergeUndo" in scan_source
+                and "撤销合并" in (frontend_src / "pages" / "MatchPage.tsx").read_text(
+                    encoding="utf-8"
+                ),
+                "ScanPage.tsx / MatchPage.tsx",
+            )
+            check(
+                "目录名可视化编辑：逐项字段块、+ 追加、点中出现叉号删除",
+                "function DirNameEditor" in settings_source
+                and "dir-name-chip" in settings_source
+                and "PlusOutlined" in settings_source
+                and "CloseOutlined" in settings_source,
+                "SettingsPage.tsx",
+            )
+
         passed = sum(1 for _, ok, _ in CHECKS if ok)
         total = len(CHECKS)
         print(f"\n结果：{passed}/{total} 通过")

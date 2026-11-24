@@ -62,6 +62,7 @@ def build_groups(files: list[dict]) -> list[dict]:
                 "episode_min": None,
                 "episode_max": None,
                 "tmdb_ids": set(),
+                "media_types": set(),
                 "matched_name": "",
                 "name_source": "",
                 "confidence": confidence,
@@ -91,6 +92,8 @@ def build_groups(files: list[dict]) -> list[dict]:
         fields = row.get("fields") or {}
         if str(fields.get("tmdb_id") or "").strip():
             group["tmdb_ids"].add(str(fields.get("tmdb_id")))
+            if fields.get("media_type"):
+                group["media_types"].add(str(fields.get("media_type")))
             group["matched_name"] = str(fields.get("series") or "")
             if fields.get("name_source"):
                 group["name_source"] = str(fields.get("name_source"))
@@ -98,12 +101,14 @@ def build_groups(files: list[dict]) -> list[dict]:
     result = []
     for group in groups.values():
         tmdb_ids = sorted(group.pop("tmdb_ids"))
+        media_types = sorted(group.pop("media_types"))
         matched_name = group.pop("matched_name")
         name_source = group.pop("name_source")
         group["seasons"] = sorted(group["seasons"])
         group["match"] = (
             {
                 "tmdb_id": int(tmdb_ids[0]) if tmdb_ids[0].isdigit() else tmdb_ids[0],
+                "media_type": media_types[0] if len(media_types) == 1 else "",
                 "name": matched_name,
                 "name_source": name_source,
             }
@@ -227,6 +232,7 @@ def build_updates(
     """
     base = {
         "tmdb_id": str(meta.get("tmdb_id") or ""),
+        "media_type": str(meta.get("media_type") or ""),
         "original_title": str(meta.get("original_name") or ""),
         "year": meta.get("year") or "",
     }

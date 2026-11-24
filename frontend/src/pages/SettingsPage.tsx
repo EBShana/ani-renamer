@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -21,11 +21,19 @@ import {
   Typography,
   message,
 } from "antd";
-import { ApiOutlined, SaveOutlined } from "@ant-design/icons";
+import { ApiOutlined, CloseOutlined, PlusOutlined, SaveOutlined } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { api } from "../api";
 import PageSections from "../components/SectionNav";
-import type { ConfigFieldSpec, ConfigSchema, PatternCacheEntry, ProviderTestResult, RuleInfo, RuleInput } from "../types";
+import type {
+  ConfigFieldSpec,
+  ConfigRepairNotice,
+  ConfigSchema,
+  PatternCacheEntry,
+  ProviderTestResult,
+  RuleInfo,
+  RuleInput,
+} from "../types";
 
 const EMPTY_RULE: RuleInput = {
   name: "",
@@ -50,9 +58,96 @@ const friendlyError = (error: unknown, fallback: string) => {
   return /[\u4e00-\u9fa5]/.test(text) ? text : fallback;
 };
 
+const DIR_NAME_KEYS = ["parse.generic_dir_names", "parse.special_dir_names"];
+
+const splitDirNames = (value: string) =>
+  value.trim() ? value.split(",").map((item) => item.trim()) : [];
+
+function DirNameEditor({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+}) {
+  const [items, setItems] = useState<string[]>(() => splitDirNames(value));
+  const [active, setActive] = useState<number | null>(null);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+
+  useEffect(() => {
+    const next = splitDirNames(value);
+    if (next.join(",") !== itemsRef.current.join(",")) {
+      setItems(next);
+      setActive(null);
+    }
+  }, [value]);
+
+  const emit = (next: string[]) => {
+    setItems(next);
+    onChange(next.join(","));
+  };
+
+  const updateItem = (index: number, text: string) => {
+    // 单个块内不允许再出现逗号，避免保存时被拆成两项
+    const clean = text.replace(/[，,]/g, "");
+    emit(items.map((item, current) => (current === index ? clean : item)));
+  };
+
+  const appendItem = () => {
+    setItems([...items, ""]);
+    setActive(items.length);
+    onChange([...items, ""].join(","));
+  };
+
+  const removeItem = (index: number) => {
+    const next = items.filter((_, current) => current !== index);
+    emit(next);
+    setActive(null);
+  };
+
+  return (
+    <Space wrap size={6} style={{ maxWidth: 720 }}>
+      {items.map((item, index) => (
+        <div
+          key={index}
+          className={`dir-name-chip${active === index ? " is-active" : ""}`}
+          onClick={() => setActive(index)}
+        >
+          <Input
+            size="small"
+            variant="borderless"
+            value={item}
+            placeholder="目录名"
+            style={{ width: Math.max(64, item.length * 14 + 24) }}
+            onFocus={() => setActive(index)}
+            onChange={(event) => updateItem(index, event.target.value)}
+          />
+          {active === index && (
+            <Button
+              type="text"
+              size="small"
+              aria-label="删除这一项"
+              icon={<CloseOutlined />}
+              onClick={(event) => {
+                event.stopPropagation();
+                removeItem(index);
+              }}
+            />
+          )}
+        </div>
+      ))}
+      <Button size="small" icon={<PlusOutlined />} onClick={appendItem}>
+        新增
+      </Button>
+    </Space>
+  );
+}
+
 export default function SettingsPage() {
   const [schema, setSchema] = useState<ConfigSchema | null>(null);
   const [values, setValues] = useState<Record<string, unknown>>({});
+  const [configNotices, setConfigNotices] = useState<ConfigRepairNotice[]>([]);
   const [rules, setRules] = useState<RuleInfo[]>([]);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
@@ -89,6 +184,7 @@ export default function SettingsPage() {
       .then(([schemaResult, configResult, rulesResult]) => {
         setSchema(schemaResult);
         setValues(configResult.values);
+        setConfigNotices(configResult.notices ?? []);
         setRules(rulesResult.rules);
       })
       .catch((error) => message.error(`读取设置失败：${(error as Error).message}`));
@@ -131,8 +227,18 @@ export default function SettingsPage() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      const result = await api.saveConfig(values);
+      const payload = { ...values };
+      // 目录名编辑器里可能有刚点「+」留下的空块，保存时清洗掉，只写真正的中文/英文名
+      for (const key of DIR_NAME_KEYS) {
+        payload[key] = String(values[key] ?? "")
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean)
+          .join(",");
+      }
+      const result = await api.saveConfig(payload);
       setValues(result.values);
+      setConfigNotices([]);
       message.success("设置已保存");
     } catch (error) {
       message.error(`保存失败：${(error as Error).message}`);
@@ -158,6 +264,14 @@ export default function SettingsPage() {
 
   const renderField = (field: ConfigFieldSpec) => {
     const value = values[field.key];
+    if (DIR_NAME_KEYS.includes(field.key)) {
+      return (
+        <DirNameEditor
+          value={String(value ?? "")}
+          onChange={(next) => updateValue(field.key, next)}
+        />
+      );
+    }
     if (field.type === "bool") {
       return <Switch checked={Boolean(value)} onChange={(checked) => updateValue(field.key, checked)} />;
     }
@@ -519,6 +633,29 @@ export default function SettingsPage() {
           message="这里是所有工作流设置的唯一来源"
           description="字幕、特典、季号、冲突处理等设置对所有预设生效。预设现在会保存整套设置；切换预设时如果和当前设置不一样，系统会先问你，也可以选只换名字不改设置。"
         />
+        {configNotices.length > 0 && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginTop: 12 }}
+            message="检测到配置文件里的中文目录名被重复编码，已经自动修复并写回"
+            description={
+              <div>
+                {configNotices.map((notice) => (
+                  <div key={notice.key}>
+                    {notice.key === "parse.special_dir_names" ? "特典类目录名" : "通用目录名"}：
+                    <Text delete>{notice.before}</Text>
+                    <Text> → </Text>
+                    <Text strong>{notice.after}</Text>
+                  </div>
+                ))}
+                <Text type="secondary">
+                  下次保存设置时会按界面上的内容写入标准 UTF-8 中文。
+                </Text>
+              </div>
+            }
+          />
+        )}
         {rules.length > 0 && (
           <Collapse
             style={{ marginTop: 12 }}

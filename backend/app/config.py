@@ -468,6 +468,31 @@ NETWORK_DRIVE_DEFAULTS: dict[str, Any] = {
 }
 
 
+DIR_NAME_KEYS = ("parse.generic_dir_names", "parse.special_dir_names")
+
+
+def repair_mojibake(value: Any) -> tuple[str, bool]:
+    """修复「UTF-8 被当成 Latin-1 解码」造成的双重编码乱码。
+
+    只对能完整按 Latin-1 编码再按 UTF-8 解码的文本生效；正常中文不会被改动。
+    """
+    text = "" if value is None else str(value)
+    current = text
+    changed = False
+    # 最多还原两层：每一层都必须能完整按 Latin-1 编码再按 UTF-8 解码，
+    # 正常中文在第一层就会编码失败，不会被误改。
+    for _ in range(2):
+        try:
+            candidate = current.encode("latin-1").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            break
+        if not candidate or candidate == current:
+            break
+        current = candidate
+        changed = True
+    return current, changed
+
+
 def load_settings() -> dict[str, Any]:
     values = _defaults()
     stored_version = 0
@@ -486,6 +511,11 @@ def load_settings() -> dict[str, Any]:
                         values[key] = value
         except (json.JSONDecodeError, OSError):
             pass
+    # 历史配置里可能把中文目录名写成了双重编码；运行期先用修好的值，界面上再提示写回。
+    for key in DIR_NAME_KEYS:
+        fixed, changed = repair_mojibake(values.get(key))
+        if changed:
+            values[key] = fixed
     # 只升级“完全没改过”的旧默认值：用户自己改过的列表保持原样。
     if str(values.get("parse.special_dir_names") or "").strip() == OLD_SPECIAL_DIR_DEFAULT:
         values["parse.special_dir_names"] = NEW_SPECIAL_DIR_DEFAULT
@@ -493,6 +523,31 @@ def load_settings() -> dict[str, Any]:
         # v3 及更早的「AI 特典识别」只是占位开关、从未生效，升级后默认打开（仍只手动触发）
         values["providers.ai_special_enabled"] = True
     return values
+
+
+def repair_settings_file() -> list[dict[str, Any]]:
+    """把配置文件里已损坏的中文目录名修好并写回，返回修复记录供界面提示。"""
+    with _lock:
+        raw = _read_raw_config()
+        stored = raw.get("values")
+        if not isinstance(stored, dict):
+            return []
+        notices: list[dict[str, Any]] = []
+        for key in DIR_NAME_KEYS:
+            before = stored.get(key)
+            fixed, changed = repair_mojibake(before)
+            if not changed:
+                continue
+            stored[key] = fixed
+            notices.append({"key": key, "before": before, "after": fixed})
+        if notices:
+            raw["values"] = stored
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            CONFIG_FILE.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return notices
 
 
 # ---------------------------------------------------------------------------

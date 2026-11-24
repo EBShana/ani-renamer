@@ -25,16 +25,23 @@ import {
   DeleteOutlined,
   EditOutlined,
   FolderOpenOutlined,
+  LinkOutlined,
   PlayCircleOutlined,
   PlusOutlined,
+  RobotOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
 import { api } from "../api";
+import BatchMatchModal from "../components/BatchMatchModal";
 import type {
   AiIdentifySuggestion,
+  AiMatchSuggestion,
   AiStatus,
   Category,
   DirectoryGroup,
+  MatchCandidate,
+  MatchGroup,
+  MergeInfo,
   NamingPreset,
   ParsedFile,
   QueueEntry,
@@ -149,6 +156,28 @@ export default function ScanPage({
   const [aiChecked, setAiChecked] = useState<string[]>([]);
   const [aiRemember, setAiRemember] = useState(true);
   const [aiNote, setAiNote] = useState("");
+  // 扫描结果分组：默认按匹配到的作品，也可以按文件所在目录
+  const [groupBy, setGroupBy] = useState<"work" | "directory">("work");
+  // 手动匹配：直接复用匹配页的搜索 / AI 建议 / 套用接口，不在扫描页另写规则
+  const [matchEntry, setMatchEntry] = useState<QueueEntry | null>(null);
+  const [matchQuery, setMatchQuery] = useState("");
+  const [matchSource, setMatchSource] = useState<"tmdb" | "bangumi">("tmdb");
+  const [matchCandidates, setMatchCandidates] = useState<MatchCandidate[]>([]);
+  const [matchFallback, setMatchFallback] = useState<MatchCandidate[]>([]);
+  const [matchSearching, setMatchSearching] = useState(false);
+  const [matchApplying, setMatchApplying] = useState("");
+  const [matchAiLoading, setMatchAiLoading] = useState(false);
+  const [matchAiHint, setMatchAiHint] = useState<{
+    query: string;
+    title?: string;
+    year?: number | null;
+    confidence?: string;
+    reason?: string;
+    from: string;
+  } | null>(null);
+  const [matchAiNote, setMatchAiNote] = useState("");
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [lastMerge, setLastMerge] = useState<MergeInfo | null>(null);
 
   const loadGroups = async (keepSelection = true) => {
     try {
@@ -349,6 +378,194 @@ export default function ScanPage({
     }
   };
 
+  const openManualMatch = (entry: QueueEntry) => {
+    setMatchEntry(entry);
+    const fallback = entry.filename.replace(/\.[^.]+$/, "");
+    const keyword = entry.work_id && entry.title ? entry.title : fallback;
+    setMatchQuery(keyword);
+    setMatchSource("tmdb");
+    setMatchCandidates([]);
+    setMatchFallback([]);
+    setMatchAiHint(null);
+    setMatchAiNote("");
+    if (keyword.trim()) void runManualSearch(keyword, "tmdb", entry);
+  };
+
+  const runManualSearch = async (
+    text?: string,
+    target: "tmdb" | "bangumi" = matchSource,
+    entryOverride?: QueueEntry,
+  ) => {
+    if (!scan) return;
+    const entry = entryOverride ?? matchEntry;
+    if (!entry) return;
+    const keyword = (text ?? matchQuery).trim();
+    if (!keyword) {
+      message.warning("请填写要搜索的作品名");
+      return;
+    }
+    setMatchSearching(true);
+    try {
+      const result = await api.matchSearch({
+        scan_id: scan.scan_id,
+        group_id: entry.work_id ?? undefined,
+        query: keyword,
+        source: target,
+      });
+      setMatchCandidates(result.candidates);
+      setMatchFallback(result.fallback ?? []);
+      if (!result.candidates.length) {
+        if (result.fallback?.length) {
+          message.info("TMDB 没有结果，下面是 Bangumi 的备用候选，可以点「用该名称搜 TMDB」再试一次");
+        } else {
+          message.info("没有找到候选，换个关键词或数据源再试");
+        }
+      }
+    } catch (error) {
+      message.error(`搜索失败：${(error as Error).message}`);
+    } finally {
+      setMatchSearching(false);
+    }
+  };
+
+  const runManualAi = async () => {
+    if (!scan || !matchEntry) return;
+    if (!aiStatus?.configured) {
+      message.warning(aiStatus?.message || "AI 还没配置好");
+      return;
+    }
+    setMatchAiLoading(true);
+    setMatchAiHint(null);
+    setMatchAiNote("");
+    try {
+      if (matchEntry.work_id) {
+        // 已归属的作品：复用匹配页的 AI 匹配建议，只取当前这一组
+        const result = await api.aiMatchSuggest({
+          scan_id: scan.scan_id,
+          include_matched: true,
+          limit: aiStatus.batch_limit,
+        });
+        const suggestion: AiMatchSuggestion | undefined = result.suggestions.find(
+          (item) => item.group_id === matchEntry.work_id,
+        );
+        if (!suggestion) {
+          setMatchAiNote(result.message || "AI 这次没有给出这部作品的建议，请手动输入关键词搜索。");
+          return;
+        }
+        setMatchAiHint({
+          query: suggestion.query,
+          title: suggestion.title,
+          year: suggestion.year,
+          confidence: suggestion.confidence,
+          reason: suggestion.reason,
+          from: suggestion.media_type === "movie" ? "AI 建议（电影）" : "AI 建议（剧集）",
+        });
+        setMatchQuery(suggestion.query);
+        await runManualSearch(suggestion.query, "tmdb", matchEntry);
+      } else {
+        // 未归属的条目：复用扫描页已有的 AI 识别建议，只取当前这个文件
+        const result = await api.aiIdentifySuggest({
+          scan_id: scan.scan_id,
+          group_id: matchEntry.group_id,
+          limit: aiStatus.batch_limit,
+        });
+        const wanted = new Set(matchEntry.file_ids);
+        const suggestion = result.suggestions.find((item) => wanted.has(item.file_id));
+        if (!suggestion) {
+          setMatchAiNote(result.message || "AI 这次没有给出这个条目的建议，请手动输入关键词搜索。");
+          return;
+        }
+        setMatchAiHint({
+          query: suggestion.title,
+          title: suggestion.title,
+          year: suggestion.year,
+          confidence: suggestion.confidence,
+          reason: suggestion.reason,
+          from: "AI 识别建议",
+        });
+        setMatchQuery(suggestion.title);
+        await runManualSearch(suggestion.title, "tmdb", matchEntry);
+      }
+    } catch (error) {
+      message.error(`AI 辅助失败：${(error as Error).message}`);
+    } finally {
+      setMatchAiLoading(false);
+    }
+  };
+
+  const applyManualMatch = async (candidate: MatchCandidate) => {
+    if (!scan || !matchEntry) return;
+    setMatchApplying(String(candidate.id));
+    try {
+      let workId = matchEntry.work_id ?? "";
+      if (!workId) {
+        // 未归属条目：先按现有指派接口建立归属，再走同一套匹配写回
+        await api.identifyAssign({
+          scan_id: scan.scan_id,
+          file_ids: matchEntry.file_ids,
+          title: candidate.name,
+          year: candidate.year,
+        });
+        const freshQueue = await api.queue(scan.scan_id);
+        const freshEntry = freshQueue.entries.find(
+          (item) => item.entry_id === matchEntry.entry_id,
+        );
+        workId = freshEntry?.work_id ?? "";
+        if (!workId) throw new Error("指派后没有找到作品，请重试");
+      }
+      const result = await api.matchApply({
+        scan_id: scan.scan_id,
+        group_id: workId,
+        tmdb_id: candidate.id,
+        media_type: candidate.media_type,
+      });
+      const fresh = await api.getScan(scan.scan_id);
+      onScan(fresh);
+      await reloadQueue();
+      setMatchEntry(null);
+      if (result.merged?.length) setLastMerge(result.merged[result.merged.length - 1]);
+      message.success(`已改匹配为「${result.meta.name}」，更新 ${result.updated} 个文件`);
+      if (result.missing.length) {
+        message.warning(
+          `有 ${result.missing.length} 集未在 TMDB 中找到（${result.missing.slice(0, 6).join("、")}）`,
+        );
+      }
+      const matchedGroup = result.groups.find((item) => item.group_id === workId);
+      if (matchedGroup?.season_pending) {
+        message.info(
+          `TMDB 有 ${matchedGroup.season_options?.length ?? 0} 个正式季，请到「匹配作品」页确认季号后再预览`,
+        );
+      }
+    } catch (error) {
+      message.error(`匹配失败：${(error as Error).message}`);
+    } finally {
+      setMatchApplying("");
+    }
+  };
+
+  const handleBatchChanged = async (groups: MatchGroup[], merged: MergeInfo[]) => {
+    void groups;
+    if (merged.length) setLastMerge(merged[merged.length - 1]);
+    if (!scan) return;
+    const fresh = await api.getScan(scan.scan_id);
+    onScan(fresh);
+    await reloadQueue();
+  };
+
+  const undoMerge = async (mergeId: string) => {
+    if (!scan) return;
+    try {
+      await api.matchMergeUndo({ scan_id: scan.scan_id, merge_id: mergeId });
+      const fresh = await api.getScan(scan.scan_id);
+      onScan(fresh);
+      await reloadQueue();
+      setLastMerge(null);
+      message.success("已撤销合并，恢复成合并前的作品组");
+    } catch (error) {
+      message.error(`撤销合并失败：${(error as Error).message}`);
+    }
+  };
+
   const openGroup = (group?: DirectoryGroup) => {
     setEditing(group ?? null);
     setForm(
@@ -426,14 +643,88 @@ export default function ScanPage({
     [groups, scanEntries],
   );
 
-  const byGroup = useMemo(() => {
-    const result: Record<string, QueueEntry[]> = {};
+  // 扫描页只改变展示分组，搜索、筛选、勾选状态都保持原样
+  const groupedEntries = useMemo(() => {
+    const nameOfGroup = (groupId?: string) => {
+      const fromScan = scan?.groups?.find((item) => item.id === groupId);
+      const fromList = groups.find((item) => item.id === groupId);
+      return fromScan?.name || fromList?.name || "";
+    };
+    const buckets = new Map<string, { key: string; label: string; entries: QueueEntry[] }>();
     for (const entry of scanEntries) {
-      const key = entry.group_id || "";
-      (result[key] ||= []).push(entry);
+      let key: string;
+      let label: string;
+      if (groupBy === "work") {
+        if (entry.work_id) {
+          key = `work:${entry.work_id}`;
+          label = `${entry.title || "未命名作品"}${entry.year ? ` (${entry.year})` : ""}`;
+        } else {
+          key = "work:__unassigned__";
+          label = "未归属（待指派）";
+        }
+      } else {
+        const rel = entry.rel_path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+        const parts = rel.split("/").filter(Boolean);
+        const dir = parts.length > 1 ? parts.slice(0, -1).join("/") : "";
+        key = `dir:${entry.group_id || ""}:${dir}`;
+        const groupName = nameOfGroup(entry.group_id);
+        label = `${groupName ? `${groupName} / ` : ""}${dir || "根目录"}`;
+      }
+      const bucket = buckets.get(key) ?? { key, label, entries: [] };
+      bucket.entries.push(entry);
+      buckets.set(key, bucket);
     }
-    return result;
-  }, [scanEntries]);
+    const list = [...buckets.values()];
+    if (groupBy === "directory") {
+      list.sort((left, right) => left.label.localeCompare(right.label, "zh-CN"));
+    } else {
+      // 未归属统一放到最后，其余保持扫描时的出现顺序
+      list.sort(
+        (left, right) =>
+          Number(left.key === "work:__unassigned__") - Number(right.key === "work:__unassigned__"),
+      );
+    }
+    return list;
+  }, [scanEntries, groupBy, groups, scan]);
+
+  // 批量匹配按「作品组」去重：同一个组里勾了多行也只算一组；未归属条目另行统计
+  const selectedWorkGroups = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of scanEntries) {
+      if (entry.work_id) counts.set(entry.work_id, (counts.get(entry.work_id) ?? 0) + 1);
+    }
+    const picked = new Map<string, QueueEntry>();
+    for (const entry of scanEntries) {
+      if (!checked.includes(entry.entry_id) || !entry.work_id || picked.has(entry.work_id)) continue;
+      picked.set(entry.work_id, entry);
+    }
+    return [...picked.values()].map((entry) => ({
+      group_id: entry.work_id as string,
+      title: entry.title,
+      year: entry.year,
+      entry_count: counts.get(entry.work_id as string) ?? 1,
+    }));
+  }, [checked, scanEntries]);
+
+  const selectedUnassigned = useMemo(
+    () => scanEntries.filter((entry) => checked.includes(entry.entry_id) && !entry.work_id).length,
+    [checked, scanEntries],
+  );
+
+  // 合并记录保存在扫描结果里，刷新页面后仍然可以撤销最近一次合并
+  const visibleMerge = useMemo<MergeInfo | null>(() => {
+    if (lastMerge) return lastMerge;
+    const merges = scan?.merges ?? [];
+    if (!merges.length) return null;
+    const last = merges[merges.length - 1];
+    return {
+      id: last.id,
+      primary: last.primary,
+      title: last.primary_title || "",
+      merged_group_ids: (last.members ?? []).map((item) => item.group_id),
+      count: (last.members?.length ?? 0) + 1,
+    };
+  }, [lastMerge, scan]);
 
   const persistSelection = (ids: string[]) => {
     if (scan) void api.saveSelection(scan.scan_id, "scan", ids).catch(() => undefined);
@@ -540,6 +831,22 @@ export default function ScanPage({
         record.category === "video" && record.file_ids.length > 1
           ? `${record.file_ids.length - 1} 个（跟随）`
           : "-",
+    },
+    {
+      title: "操作",
+      width: 108,
+      render: (_, record) =>
+        record.category === "video" ? (
+          <Button
+            size="small"
+            icon={<LinkOutlined />}
+            onClick={() => openManualMatch(record)}
+          >
+            手动匹配
+          </Button>
+        ) : (
+          <Text type="secondary">-</Text>
+        ),
     },
   ];
 
@@ -841,12 +1148,56 @@ export default function ScanPage({
             groupOptions={groupOptions}
             selectedCount={filteredChecked}
             totalCount={scanEntries.length}
+            leading={
+              <Space size={4}>
+                <Text type="secondary">分组</Text>
+                <Select
+                  style={{ width: 116 }}
+                  value={groupBy}
+                  onChange={(value) => setGroupBy(value as "work" | "directory")}
+                  options={[
+                    { value: "work", label: "按作品" },
+                    { value: "directory", label: "按目录" },
+                  ]}
+                />
+                <Tooltip
+                  title={
+                    selectedWorkGroups.length
+                      ? "把勾选到的作品组一次匹配到同一部作品，或让 AI 给出候选后逐个确认"
+                      : "先在下面勾选作品组里的条目"
+                  }
+                >
+                  <Button
+                    size="small"
+                    icon={<LinkOutlined />}
+                    disabled={selectedWorkGroups.length === 0}
+                    onClick={() => setBatchOpen(true)}
+                  >
+                    批量匹配{selectedWorkGroups.length ? `（${selectedWorkGroups.length} 组）` : ""}
+                  </Button>
+                </Tooltip>
+              </Space>
+            }
             extra={
               <Text type="secondary">
                 总已选 {checked.length} / 留在本页 {Math.max(0, (queue?.counts.scan ?? 0) - checked.length)}
               </Text>
             }
           />
+          {visibleMerge && (
+            <Alert
+              type="success"
+              showIcon
+              style={{ marginBottom: 12 }}
+              message={`已自动合并 ${visibleMerge.count} 个「${visibleMerge.title}」作品组`}
+              description="组标题已统一；勾选状态、未归属指派和已有季号都保留。只允许撤销最近一次合并。"
+              action={
+                <Button size="small" onClick={() => void undoMerge(visibleMerge.id)}>
+                  撤销合并
+                </Button>
+              }
+            />
+          )}
           {scanEntries.length === 0 ? (
             <Empty
               description={
@@ -857,16 +1208,16 @@ export default function ScanPage({
             />
           ) : (
             <Collapse
-              key={Object.keys(byGroup).join("|")}
-              defaultActiveKey={Object.keys(byGroup)}
-              items={Object.entries(byGroup).map(([groupId, entries]) => {
+              key={`${groupBy}:${groupedEntries.map((item) => item.key).join("|")}`}
+              defaultActiveKey={groupedEntries.map((item) => item.key)}
+              items={groupedEntries.map(({ key, label, entries }) => {
                 const ids = entries.map((entry) => entry.entry_id);
                 const picked = ids.filter((id) => checked.includes(id)).length;
                 return {
-                  key: groupId || "none",
+                  key,
                   label: (
                     <Space>
-                      <Text strong>{groupNameOf(groupId) || "未分组"}</Text>
+                      <Text strong>{label}</Text>
                       <Tag>{entries.length} 项</Tag>
                       {picked > 0 && <Tag color="blue">已选 {picked}</Tag>}
                     </Space>
@@ -1155,6 +1506,255 @@ export default function ScanPage({
             </List.Item>
           )}
         />
+      </Modal>
+
+      {scan && (
+        <BatchMatchModal
+          open={batchOpen}
+          scanId={scan.scan_id}
+          targets={selectedWorkGroups}
+          skippedUnassigned={selectedUnassigned}
+          aiConfigured={Boolean(aiStatus?.configured)}
+          aiMessage={aiStatus?.message}
+          aiLimit={aiStatus?.batch_limit ?? 20}
+          onClose={() => setBatchOpen(false)}
+          onChanged={handleBatchChanged}
+        />
+      )}
+
+      <Modal
+        title={matchEntry ? `手动匹配：${matchEntry.filename}` : "手动匹配"}
+        open={Boolean(matchEntry)}
+        onCancel={() => setMatchEntry(null)}
+        footer={null}
+        width={760}
+      >
+        <Space direction="vertical" size={12} style={{ width: "100%" }}>
+          <Alert
+            type="info"
+            showIcon
+            message={
+              matchEntry?.work_id
+                ? "改的是整个作品组：同一作品下的所有文件会一起换成新作品的名称、季集信息和目标路径，下一次预览按新结果生成。"
+                : "这个条目还没归属作品：选中候选后会先建立归属，再套用 TMDB 的季集信息。"
+            }
+            description="已执行过的历史记录不受影响；只影响当前扫描的后续预览与执行。"
+          />
+          <Space.Compact style={{ width: "100%" }}>
+            <Input
+              value={matchQuery}
+              onChange={(event) => setMatchQuery(event.target.value)}
+              onPressEnter={() => void runManualSearch()}
+              placeholder="输入作品名，可改成中文 / 日文 / 英文"
+            />
+            <Select
+              style={{ width: 112 }}
+              value={matchSource}
+              onChange={(value) => {
+                const next = value as "tmdb" | "bangumi";
+                setMatchSource(next);
+                if (matchQuery.trim()) void runManualSearch(matchQuery, next);
+              }}
+              options={[
+                { value: "tmdb", label: "TMDB" },
+                { value: "bangumi", label: "Bangumi" },
+              ]}
+            />
+            <Button type="primary" loading={matchSearching} onClick={() => void runManualSearch()}>
+              搜索
+            </Button>
+          </Space.Compact>
+          <Space wrap size={8}>
+            <Tooltip
+              title={
+                !aiStatus
+                  ? "AI 状态加载中"
+                  : !aiStatus.configured
+                    ? aiStatus.message
+                    : matchEntry?.work_id
+                      ? "按当前作品问 AI 要一个更准的搜索关键词，仍需你从候选中选择"
+                      : "让 AI 先判断这个文件可能是什么作品，仍需你从候选中选择"
+              }
+            >
+              <Button
+                icon={<RobotOutlined />}
+                loading={matchAiLoading}
+                disabled={!aiStatus?.configured}
+                onClick={() => void runManualAi()}
+              >
+                AI 辅助给候选
+              </Button>
+            </Tooltip>
+            {matchAiNote && (
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {matchAiNote}
+              </Text>
+            )}
+          </Space>
+          {matchAiHint && (
+            <Alert
+              type="warning"
+              showIcon
+              message={
+                <Space wrap size={6}>
+                  <Tag color="purple">{matchAiHint.from}</Tag>
+                  <Text>{matchAiHint.title || matchAiHint.query}</Text>
+                  {matchAiHint.year != null && (
+                    <Text type="secondary">({matchAiHint.year})</Text>
+                  )}
+                  {matchAiHint.confidence && <Tag>{matchAiHint.confidence}</Tag>}
+                </Space>
+              }
+              description={
+                <div>
+                  {matchAiHint.reason && (
+                    <div style={{ marginBottom: 6 }}>判断依据：{matchAiHint.reason}</div>
+                  )}
+                  <Text type="secondary">
+                    AI 只给关键词，不会直接套用；请从下方候选中选择正确作品。
+                  </Text>
+                </div>
+              }
+              action={
+                <Button size="small" onClick={() => void runManualSearch(matchAiHint.query, "tmdb")}>
+                  用这个关键词搜索
+                </Button>
+              }
+            />
+          )}
+          <List
+            loading={matchSearching}
+            dataSource={matchCandidates}
+            locale={{ emptyText: "输入关键词后搜索，或点「AI 辅助给候选」" }}
+            renderItem={(candidate) => (
+              <List.Item
+                actions={[
+                  candidate.source === "bangumi" ? (
+                    <Button
+                      key="retry"
+                      size="small"
+                      onClick={() => {
+                        setMatchQuery(candidate.name);
+                        setMatchSource("tmdb");
+                        void runManualSearch(candidate.name, "tmdb");
+                      }}
+                    >
+                      用该名称搜 TMDB
+                    </Button>
+                  ) : (
+                    <Button
+                      key="use"
+                      type="primary"
+                      size="small"
+                      icon={<LinkOutlined />}
+                      loading={matchApplying === String(candidate.id)}
+                      onClick={() => void applyManualMatch(candidate)}
+                    >
+                      使用这条
+                    </Button>
+                  ),
+                ]}
+              >
+                <List.Item.Meta
+                  avatar={
+                    candidate.poster ? (
+                      <img
+                        src={candidate.poster}
+                        alt=""
+                        style={{ width: 54, height: 80, objectFit: "cover", borderRadius: 4 }}
+                      />
+                    ) : (
+                      <div
+                        style={{
+                          width: 54,
+                          height: 80,
+                          borderRadius: 4,
+                          background: "var(--ani-subtle)",
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          color: "var(--ani-text-tertiary)",
+                          fontSize: 12,
+                        }}
+                      >
+                        无图
+                      </div>
+                    )
+                  }
+                  title={
+                    <Space wrap size={6}>
+                      <span>{candidate.name || candidate.original_name}</span>
+                      {candidate.year && <Tag color="blue">{candidate.year}</Tag>}
+                      <Tag>{candidate.media_type === "movie" ? "电影" : "剧集"}</Tag>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        #{candidate.id}
+                      </Text>
+                    </Space>
+                  }
+                  description={
+                    <div>
+                      {candidate.original_name && candidate.original_name !== candidate.name && (
+                        <Text type="secondary" style={{ fontSize: 12 }}>
+                          {candidate.original_name}
+                          <br />
+                        </Text>
+                      )}
+                      <Text type="secondary" style={{ fontSize: 12 }}>
+                        {candidate.overview || "暂无简介"}
+                      </Text>
+                    </div>
+                  }
+                />
+              </List.Item>
+            )}
+          />
+          {matchCandidates.length === 0 && matchFallback.length > 0 && (
+            <div>
+              <Alert
+                type="info"
+                showIcon
+                message="TMDB 没有结果，下面是 Bangumi 的备用候选"
+                description="点「用该名称搜 TMDB」会用 Bangumi 的中文名 / 日文原名再查一次 TMDB，确认后再套用 TMDB 的单集数据。"
+                style={{ marginBottom: 8 }}
+              />
+              <List
+                dataSource={matchFallback}
+                renderItem={(candidate) => (
+                  <List.Item
+                    actions={[
+                      <Button
+                        key="retry"
+                        size="small"
+                        onClick={() => {
+                          setMatchQuery(candidate.name);
+                          setMatchSource("tmdb");
+                          void runManualSearch(candidate.name, "tmdb");
+                        }}
+                      >
+                        用该名称搜 TMDB
+                      </Button>,
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={
+                        <Space wrap size={6}>
+                          <span>{candidate.name || candidate.original_name}</span>
+                          {candidate.year && <Tag color="blue">{candidate.year}</Tag>}
+                          <Tag color="purple">Bangumi</Tag>
+                        </Space>
+                      }
+                      description={
+                        candidate.original_name && candidate.original_name !== candidate.name
+                          ? candidate.original_name
+                          : "暂无原名"
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            </div>
+          )}
+        </Space>
       </Modal>
       </Space>
     </PageSections>

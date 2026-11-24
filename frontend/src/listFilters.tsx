@@ -107,6 +107,8 @@ interface Props {
   groupOptions: { value: string; label: string }[];
   selectedCount: number;
   totalCount: number;
+  /** 放在搜索框前面的额外控件（例如扫描页的分组依据） */
+  leading?: ReactNode;
   extra?: ReactNode;
 }
 
@@ -116,11 +118,13 @@ export default function ListFilterBar({
   groupOptions,
   selectedCount,
   totalCount,
+  leading,
   extra,
 }: Props) {
   const patch = (partial: Partial<ListFilterValue>) => onChange({ ...value, ...partial });
   return (
     <Space wrap style={{ marginBottom: 12 }}>
+      {leading}
       <Input
         prefix={<SearchOutlined />}
         placeholder="按作品名 / 文件名搜索"

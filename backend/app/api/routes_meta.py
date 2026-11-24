@@ -5,7 +5,13 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
-from ..config import config_schema, get_media_root, load_settings, save_settings
+from ..config import (
+    config_schema,
+    get_media_root,
+    load_settings,
+    repair_settings_file,
+    save_settings,
+)
 from ..core.fields import field_payload
 from ..core.metadata import test_connectivity
 from ..scanner_helpers import is_under
@@ -32,7 +38,12 @@ def fields() -> dict:
 
 @router.get("/config")
 def read_config() -> dict:
-    return {"values": load_settings(), "media_root": str(get_media_root())}
+    notices = repair_settings_file()
+    return {
+        "values": load_settings(),
+        "media_root": str(get_media_root()),
+        "notices": notices,
+    }
 
 
 @router.get("/config/schema")

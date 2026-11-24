@@ -20,6 +20,8 @@ from ..core.metadata import (
     search_tmdb,
 )
 from ..core.matcher import auto_pick, build_groups, build_updates, find_group
+from ..core.merge import merge_same_work, undo_merge
+from ..core.queue import refresh_queue
 from ..core.season_plan import build_season_plan
 from ..core.scan_store import apply_field_updates, get_scan, save_scan
 from ..store import create_alias, list_aliases, record_decision, update_alias
@@ -380,6 +382,24 @@ def _apply_meta_with_retry(
             raise
 
 
+class MergeUndoRequest(BaseModel):
+    scan_id: str
+    merge_id: str | None = None
+
+
+@router.post("/match/merge-undo")
+def match_merge_undo(payload: MergeUndoRequest) -> dict:
+    """撤销最近一次自动合并，恢复原来的作品组与季号状态。"""
+    scan = _scan_or_404(payload.scan_id)
+    undone = undo_merge(scan, payload.merge_id)
+    if undone is None:
+        raise HTTPException(status_code=400, detail="没有可撤销的合并，或不是最近一次合并")
+    return {
+        "undone": undone,
+        "groups": _decorate_groups(scan, build_groups(scan.get("files", []))),
+    }
+
+
 @router.post("/match/apply")
 def match_apply(payload: ApplyRequest) -> dict:
     scan = _scan_or_404(payload.scan_id)
@@ -391,6 +411,11 @@ def match_apply(payload: ApplyRequest) -> dict:
     except MetadataError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # 匹配成同一部 TMDB 作品后立即合并
+    merged = merge_same_work(scan)
+    # 匹配后清单里的作品名 / 年份要跟着更新，扫描页按作品分组才不会显示旧名字
+    refresh_queue(scan)
+    save_scan(scan)
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
     record_decision(
         payload.scan_id,
@@ -404,6 +429,70 @@ def match_apply(payload: ApplyRequest) -> dict:
         "missing": missing,
         "meta": _meta_brief(meta),
         "groups": groups,
+        "merged": merged,
+    }
+
+
+class BatchApplyRequest(BaseModel):
+    scan_id: str
+    group_ids: list[str]
+    tmdb_id: int
+    media_type: str = "tv"
+
+
+@router.post("/match/apply-batch")
+def match_apply_batch(payload: BatchApplyRequest) -> dict:
+    """把同一部 TMDB 作品一次套用到多个作品组；逐个返回成功 / 失败，不因一个失败中断。"""
+    scan = _scan_or_404(payload.scan_id)
+    group_ids: list[str] = []
+    for group_id in payload.group_ids or []:
+        if group_id and group_id not in group_ids:
+            group_ids.append(group_id)
+    if not group_ids:
+        raise HTTPException(status_code=400, detail="请先选择要匹配的作品组")
+
+    results: list[dict] = []
+    for group_id in group_ids:
+        try:
+            group, rows = _group_or_404(scan, group_id)
+            meta, updated, missing = _apply_meta(
+                scan, group, rows, payload.tmdb_id, payload.media_type
+            )
+            results.append(
+                {
+                    "group_id": group_id,
+                    "title": str(group.get("title") or ""),
+                    "ok": True,
+                    "updated": updated,
+                    "missing": missing,
+                    "meta": _meta_brief(meta),
+                }
+            )
+            record_decision(
+                payload.scan_id,
+                "match",
+                group_id,
+                choice=f"{payload.media_type}:{payload.tmdb_id}",
+                source="human",
+            )
+        except Exception as exc:  # 单个组失败不影响其他组，失败原因逐个返回
+            detail = exc.detail if isinstance(exc, HTTPException) else str(exc)
+            results.append(
+                {
+                    "group_id": group_id,
+                    "title": "",
+                    "ok": False,
+                    "error": str(detail),
+                }
+            )
+
+    merged = merge_same_work(scan)
+    refresh_queue(scan)
+    save_scan(scan)
+    return {
+        "results": results,
+        "merged": merged,
+        "groups": _decorate_groups(scan, build_groups(scan.get("files", []))),
     }
 
 
@@ -425,6 +514,7 @@ def match_rename(payload: RenameRequest) -> dict:
         raise HTTPException(status_code=400, detail="这个作品还没有匹配到 TMDB，请先匹配再改名")
     updates = {str(row["id"]): {"series": name, "name_source": "manual"} for row in rows}
     updated = apply_field_updates(scan["scan_id"], updates)
+    refresh_queue(scan)
     save_scan(scan)
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
     record_decision(payload.scan_id, "rename", payload.group_id, choice=name)
@@ -486,6 +576,7 @@ def match_season(payload: SeasonRequest) -> dict:
     updated = apply_field_updates(scan["scan_id"], updates)
     info["choice"] = payload.season
     info["mode"] = "manual"
+    refresh_queue(scan)
     save_scan(scan)
     record_decision(payload.scan_id, "season", payload.group_id, choice=str(payload.season))
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
@@ -732,6 +823,9 @@ def match_auto(payload: AutoRequest) -> dict:
 
         results.append(entry)
 
+    merged = merge_same_work(scan)
+    refresh_queue(scan)
+    save_scan(scan)
     groups = _decorate_groups(scan, build_groups(scan.get("files", [])))
     summary = {"auto": 0, "choose": 0, "missing": 0}
     for item in results:
@@ -741,4 +835,5 @@ def match_auto(payload: AutoRequest) -> dict:
         "groups": groups,
         "summary": summary,
         "total": len(results),
+        "merged": merged,
     }
